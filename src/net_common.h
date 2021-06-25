@@ -17,15 +17,22 @@
 #include "common.h"
 
 #include <rte_mbuf.h>
+#include <rte_ethdev.h>
 
 #define MEHCACHED_MAX_LCORES (16)
 #define MEHCACHED_MAX_NUMA_NODES (2)
 
-#define MEHCACHED_MAX_PORTS (8)
-#define MEHCACHED_MAX_QUEUES (16)
+#define MEHCACHED_MAX_PORTS (1)
+#define MEHCACHED_MAX_QUEUES (8)
+
+#define RTE_TEST_RX_DESC_DEFAULT (1024)
+#define RTE_TEST_TX_DESC_DEFAULT (1024)
 
 struct rte_mbuf *
 mehcached_packet_alloc();
+
+struct rte_mbuf *
+mehcached_packet_alloc_nicmem(int port_id);
 
 void
 mehcached_packet_free(struct rte_mbuf *mbuf);
@@ -52,7 +59,7 @@ struct rte_mbuf *
 mehcached_clone_packet(struct rte_mbuf *mbuf_src);
 
 bool
-mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_ports);
+mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_ports, int nicmem, int inline_min, rte_post_tx_callback_fn txcb, uint16_t priv_size);
 
 void
 mehcached_free_network(uint64_t port_mask);

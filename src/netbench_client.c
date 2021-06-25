@@ -38,6 +38,8 @@
 
 #define RX_SAMPLE_RATE (64)		// must be a power of 2
 
+static int nicmem = 0;
+
 struct packet_construction_state
 {
 	struct rte_mbuf *mbuf;
@@ -53,7 +55,7 @@ struct client_state
     struct mehcached_server_conf *server_conf;
 
 	struct mehcached_hot_item_hash hot_item_hash;
-	uint8_t header_template[sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)];
+	uint8_t header_template[sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr)];
 
 	// runtime state
 	struct packet_construction_state constr_state_e[MEHCACHED_MAX_PARTITIONS];
@@ -132,7 +134,7 @@ mehcached_hash_key(uint64_t int_key)
 
 static
 uint16_t
-mehcached_calc_ip_checksum(struct ipv4_hdr *ip)
+mehcached_calc_ip_checksum(struct rte_ipv4_hdr *ip)
 {
 	uint16_t *ptr16;
     uint32_t ip_cksum;
@@ -156,7 +158,7 @@ mehcached_calc_ip_checksum(struct ipv4_hdr *ip)
 
 static
 void
-mehcached_update_ip_checksum(struct ipv4_hdr *ip, uint16_t old_v, uint16_t new_v)
+mehcached_update_ip_checksum(struct rte_ipv4_hdr *ip, uint16_t old_v, uint16_t new_v)
 {
 	// rfc1624
 	ip->hdr_checksum = (uint16_t)(~(~ip->hdr_checksum + ~old_v + new_v));
@@ -168,11 +170,11 @@ mehcached_init_header_template(struct client_state *state)
 {
 	memset(state->header_template, 0, sizeof(state->header_template));
 
-	struct ether_hdr *eth = (struct ether_hdr *)state->header_template;
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = (struct rte_ether_hdr *)state->header_template;
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
-	eth->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
+	eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
 	ip->version_ihl = 0x40 | 0x05;
 	ip->type_of_service = 0;
@@ -208,7 +210,7 @@ mehcached_remote_check_response(struct client_state *state)
 	    if (mbuf == NULL)
 	    	break;
 
-	    state->bytes_rx += (uint64_t)(mbuf->pkt.data_len + 24);	// 24 for PHY overheads
+	    state->bytes_rx += (uint64_t)(rte_pktmbuf_data_len(mbuf) + 24);	// 24 for PHY overheads
 
 		struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, struct mehcached_batch_packet *);
 	    const uint8_t *next_key = packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests;
@@ -284,9 +286,9 @@ mehcached_init_packet(struct client_state *state, struct packet_construction_sta
 	struct rte_mbuf *mbuf = mehcached_packet_alloc();
 	assert(mbuf != NULL);
 
-	struct ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
 	rte_memcpy(eth, state->header_template, sizeof(state->header_template));
 
@@ -299,8 +301,8 @@ mehcached_init_packet(struct client_state *state, struct packet_construction_sta
 	packet->reserved0 = 0;
 	packet->opaque = 0;
 
-	mbuf->pkt.next = NULL;
-	mbuf->pkt.nb_segs = 1;
+	mbuf->next = NULL;
+	mbuf->nb_segs = 1;
 	mbuf->ol_flags = 0;
 
 	assert(constr_state->mbuf == NULL);
@@ -358,9 +360,9 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 	assert(constr_state->mbuf != NULL);
 	assert(mehcached_need_to_send_packet(state, constr_state));
 
-	struct ether_hdr *eth = rte_pktmbuf_mtod(constr_state->mbuf, struct ether_hdr *);
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(constr_state->mbuf, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
 	struct mehcached_batch_packet *packet = (struct mehcached_batch_packet *)eth;
 
@@ -428,7 +430,7 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 	rte_memcpy(&ip->dst_addr, state->server_conf->ports[server_port_id].ip_addr, 4);
 
 	uint16_t packet_length = (uint16_t)(constr_state->next_key - (uint8_t *)packet);
-	ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr)));
+	ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr)));
 
 	// assume the previous checksum was calculated with both IP addresses = 0 and total_length = 0
 	mehcached_update_ip_checksum(ip, 0, (uint16_t)(ip->src_addr >> 16));
@@ -437,14 +439,14 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 	mehcached_update_ip_checksum(ip, 0, (uint16_t)(ip->dst_addr >> 0));
 	mehcached_update_ip_checksum(ip, 0, ip->total_length);
 
-	udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr)));
+	udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr)));
 
-	constr_state->mbuf->pkt.data_len = packet_length;
-	constr_state->mbuf->pkt.pkt_len = (uint32_t)packet_length;
+	rte_pktmbuf_data_len(constr_state->mbuf) = packet_length;
+	rte_pktmbuf_pkt_len(constr_state->mbuf) = (uint32_t)packet_length;
 
 #ifndef NDEBUG
-    rte_mbuf_sanity_check(constr_state->mbuf, RTE_MBUF_PKT, 1);
-    assert(rte_pktmbuf_headroom(constr_state->mbuf) + constr_state->mbuf->pkt.data_len <= constr_state->mbuf->buf_len);
+    rte_mbuf_sanity_check(constr_state->mbuf, 1);
+    assert(rte_pktmbuf_headroom(constr_state->mbuf) + rte_pktmbuf_data_len(constr_state->mbuf) <= constr_state->mbuf->buf_len);
 #endif
 
 	mehcached_send_packet(port_id, constr_state->mbuf);
@@ -1069,8 +1071,8 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 	};
 	int rte_argc = sizeof(rte_argv) / sizeof(rte_argv[0]);
 
-    //rte_set_log_level(RTE_LOG_DEBUG);
-    rte_set_log_level(RTE_LOG_NOTICE);
+	//rte_log_set_global_level(RTE_LOG_DEBUG);
+	rte_log_set_global_level(RTE_LOG_NOTICE);
 
 	int ret = rte_eal_init(rte_argc, rte_argv);
 	if (ret < 0)
@@ -1083,7 +1085,7 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 
 	uint8_t num_ports_max;
 	uint64_t port_mask = ((size_t)1 << client_conf->num_ports) - 1;
-	if (!mehcached_init_network(cpu_mask, port_mask, &num_ports_max))
+	if (!mehcached_init_network(cpu_mask, port_mask, &num_ports_max, nicmem, NULL, 0))
 	{
 		fprintf(stderr, "failed to initialize network\n");
 		return;
@@ -1095,8 +1097,8 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
     uint8_t port_id;
     for (port_id = 0; port_id < client_conf->num_ports; port_id++)
     {
-    	struct ether_addr mac_addr;
-    	memcpy(&mac_addr, client_conf->ports[port_id].mac_addr, sizeof(struct ether_addr));
+    	struct rte_ether_addr mac_addr;
+    	memcpy(&mac_addr, client_conf->ports[port_id].mac_addr, sizeof(struct rte_ether_addr));
     	if (rte_eth_dev_mac_addr_add(port_id, &mac_addr, 0) != 0)
     	{
 			fprintf(stderr, "failed to add a MAC address\n");

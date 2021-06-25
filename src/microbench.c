@@ -20,8 +20,11 @@
 
 #include "mehcached.h"
 #include "hash.h"
+#include "table.h"
 #include "zipf.h"
 #include "perf_count/perf_count.h"
+#include "alloc_dynamic.h"
+#include "alloc_pool.h"
 
 #include "netbench_config.h"
 
@@ -209,7 +212,7 @@ benchmark_proc(void *arg)
                 if (i >= 0)
                 {
                     struct mehcached_table *table = tables[op_key_parts[i]];
-                    if (mehcached_set(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, op_values + (size_t)i * value_length, value_length, 0, false))
+                    if (mehcached_set(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, op_values + (size_t)i * value_length, value_length, 0, false, -1))
                         success_count++;
                 }
             }
@@ -240,20 +243,22 @@ benchmark_proc(void *arg)
                     {
                         uint8_t value[value_length];
                         size_t value_length = value_length;
-						bool readonly;
-						if (thread_id == owner_thread_id[op_key_parts[i]])
-							readonly = false;
-						else if (concurrency_mode >= CONCURRENCY_MODE_CRCW) // concurrent_table_write
-							readonly = false;
-						else
-							readonly = true;
-                        if (mehcached_get(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, value, &value_length, NULL, readonly))
+			bool readonly;
+			if (thread_id == owner_thread_id[op_key_parts[i]])
+				readonly = false;
+			else if (concurrency_mode >= CONCURRENCY_MODE_CRCW) // concurrent_table_write
+				readonly = false;
+			else
+				readonly = true;
+
+			int copy = true;
+                        if (mehcached_get(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, value, &value_length, NULL, readonly, &copy, NULL, NULL))
                             success_count++;
                         junk += (uint64_t)value[0];
                     }
                     else
                     {
-                        if (mehcached_set(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, op_values + (size_t)i * value_length, value_length, 0, true))
+                        if (mehcached_set(alloc_id, table, op_key_hashes[i], op_keys + (size_t)i * key_length, key_length, op_values + (size_t)i * value_length, value_length, 0, true, -1))
                             success_count++;
                     }
                 }
@@ -338,10 +343,10 @@ benchmark(const concurrency_mode_t concurrency_mode, double zipf_theta, double m
     printf("initializing shm\n");
 	const size_t page_size = 1048576 * 2;
 	const size_t num_numa_nodes = 2;
-    const size_t num_pages_to_try = 16384;
-    const size_t num_pages_to_reserve = 16384 - 2048;   // give 2048 pages to dpdk
+    const size_t num_pages_to_try = 32768;
+    const size_t num_pages_to_reserve = 32768 - 2048;   // give 2048 pages to dpdk
 
-	mehcached_shm_init(page_size, num_numa_nodes, num_pages_to_try, num_pages_to_reserve);
+    mehcached_shm_init(page_size, num_numa_nodes, num_pages_to_try, num_pages_to_reserve);
 
 
     printf("initializing DPDK\n");
@@ -355,7 +360,7 @@ benchmark(const concurrency_mode_t concurrency_mode, double zipf_theta, double m
 	char *rte_argv[] = {"", "-c", cpu_mask_str, "-m", memory_str, "-n", "4"};
 	int rte_argc = sizeof(rte_argv) / sizeof(rte_argv[0]);
 
-    rte_set_log_level(RTE_LOG_NOTICE);
+    rte_log_set_global_level(RTE_LOG_DEBUG);
 
 	int ret = rte_eal_init(rte_argc, rte_argv);
 	if (ret < 0)
@@ -439,10 +444,12 @@ benchmark(const concurrency_mode_t concurrency_mode, double zipf_theta, double m
     {
         owner_thread_id[partition_id] = partition_id % num_threads;
 
-        size_t table_numa_node = rte_lcore_to_socket_id((unsigned int)owner_thread_id[partition_id]);
+        // size_t table_numa_node = rte_lcore_to_socket_id((unsigned int)owner_thread_id[partition_id]);
+        size_t table_numa_node = 0;
         // TODO: support CRCW (multiple allocs)
         size_t alloc_numa_nodes[1];
-        alloc_numa_nodes[0] = rte_lcore_to_socket_id((unsigned int)owner_thread_id[partition_id]);
+        // alloc_numa_nodes[0] = rte_lcore_to_socket_id((unsigned int)owner_thread_id[partition_id]);
+        alloc_numa_nodes[0] = 0;
 
         tables[partition_id] = mehcached_shm_malloc_contiguous(sizeof(struct mehcached_table), owner_thread_id[partition_id]);
         assert(tables[partition_id]);

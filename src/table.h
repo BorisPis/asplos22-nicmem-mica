@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __TABLE_H__
+#define __TABLE_H__
+
 #pragma once
 
 #include "common.h"
@@ -19,7 +22,14 @@
 #include "alloc_malloc.h"
 #include "alloc_dynamic.h"
 
+#include <rte_mbuf.h>
+
 MEHCACHED_BEGIN
+
+#define MEHCACHED_MAX_NICMEM (131072) // nicmem observed in dual-port cx5 devices
+#define MEHCACHED_MAX_NICMEM_MASK (131072 - 1)
+#define MEHCACHED_SET_NICMEM(port_id, offset) \
+	(((port_id) << 56) | ((offset) & MEHCACHED_MAX_NICMEM_MASK))
 
 #define MEHCACHED_MAX_KEY_LENGTH (255)
 #define MEHCACHED_MAX_VALUE_LENGTH (1048575)
@@ -61,7 +71,7 @@ typedef enum _MEHCACHED_RESULT
 
 struct mehcached_bucket
 {
-    uint32_t version;   // XXX: is uint32_t wide enough?
+    uint32_t version;
     uint32_t next_extra_bucket_index;   // 1-base; 0 = no extra bucket
     uint64_t item_vec[MEHCACHED_ITEMS_PER_BUCKET];
 
@@ -108,9 +118,15 @@ struct mehcached_item
 
     #define MEHCACHED_KV_LENGTH_VEC(key_length, value_length) (((uint32_t)(key_length) << 24) | (uint32_t)(value_length))
 
+    #define MEHCACHED_EXT_PORT_ID(x) (x & ((uint64_t)0xff << 56))
+    #define  MEHCACHED_EXT_OFFSET(x) (x & (((uint64_t)1 << 56) - 1))
+
+
     // the rest is meaningful only when kv_length_vec != 0
     uint32_t expire_time;
     uint64_t key_hash;
+#define SPLIT_MARKER (0xff00000000000000ULL)
+    struct mehcached_alloc_item *extptr;
     uint8_t data[0];
 };
 
@@ -120,6 +136,8 @@ struct mehcached_table
 {
 #ifdef MEHCACHED_ALLOC_POOL
     struct mehcached_pool alloc[MEHCACHED_MAX_POOLS];
+    struct mehcached_pool alloc2[MEHCACHED_MAX_POOLS];
+    // struct rte_mempool *mempool[MEHCACHED_MAX_POOLS];
     uint8_t alloc_id_mask;
     uint64_t mth_threshold;
 #endif
@@ -206,89 +224,90 @@ struct mehcached_request
     // 24
 };
 
-static
+
 void
 mehcached_print_bucket(const struct mehcached_bucket *bucket);
 
-static
+
 void
 mehcached_print_buckets(const struct mehcached_table *table);
 
-static
+
 void
 mehcached_print_stats(const struct mehcached_table *table);
 
-static
+
 void
 mehcached_reset_table_stats(struct mehcached_table *table);
 
-static
+
 uint32_t
 mehcached_calc_bucket_index(const struct mehcached_table *table, uint64_t key_hash);
 
-static
+
 uint16_t
 mehcached_calc_tag(uint64_t key_hash);
 
-static
-void
-mehcached_set_item(struct mehcached_item *item, uint64_t key_hash, const uint8_t *key, uint32_t key_length, const uint8_t *value, uint32_t value_length, uint32_t expire_time);
 
-static
+void
+mehcached_set_item(struct mehcached_item *item, uint64_t key_hash, const uint8_t *key, uint32_t key_length, const uint8_t *value, uint32_t value_length, uint32_t expire_time, struct mehcached_alloc_item *extptr, uintptr_t nicptr);
+
+
 void
 mehcached_set_item_value(struct mehcached_item *item, const uint8_t *value, uint32_t value_length, uint32_t expire_time);
 
-static
-bool
+
+int
 mehcached_compare_keys(const uint8_t *key1, size_t key1_len, const uint8_t *key2, size_t key2_len);
 
-static
+
 void
 mehcached_cleanup_all(uint8_t current_alloc_id, struct mehcached_table *table);
 
-static
+
 void
 mehcached_prefetch_table(struct mehcached_table *table, uint64_t key_hash, struct mehcached_prefetch_state *out_prefetch_state);
 
-static
+
 void
 mehcached_prefetch_alloc(struct mehcached_prefetch_state *in_out_prefetch_state);
 
-static
-bool
-mehcached_get(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint8_t *out_value, size_t *in_out_value_length, uint32_t *out_expire_time, bool readonly);
 
-static
-bool
+int
+mehcached_get(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint8_t *out_value, size_t *in_out_value_length, uint32_t *out_expire_time, int readonly, int *copy, uintptr_t *pData, struct mehcached_item **oItem);
+
+
+int
 mehcached_test(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length);
 
-static
-bool
-mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, bool overwrite);
 
-static
-bool
+int
+mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, int overwrite, uint64_t nicptr);
+
+
+int
 mehcached_delete(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length);
 
-static
-bool
+
+int
 mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint64_t increment, uint64_t *out_new_value, uint32_t expire_time);
 
-static
-void
-mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table, struct mehcached_request *requests, size_t num_requests, const uint8_t *in_data, uint8_t *out_data, size_t *out_data_length, bool readonly);
 
-static
+void
+mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table, struct mehcached_request *requests, size_t num_requests, const uint8_t *in_data, uint8_t *out_data, size_t *out_data_length, int readonly);
+
+
 void
 mehcached_table_reset(struct mehcached_table *table);
 
-static
-void
-mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t num_pools, size_t pool_size, bool concurrent_table_read, bool concurrent_table_write, bool concurrent_alloc_write, size_t table_numa_node, size_t alloc_numa_nodes[], double mth_threshold);
 
-static
+void
+mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t num_pools, size_t pool_size, int concurrent_table_read, int concurrent_table_write, int concurrent_alloc_write, size_t table_numa_node, size_t alloc_numa_nodes[], double mth_threshold);
+
+
 void
 mehcached_table_free(struct mehcached_table *table);
 
 MEHCACHED_END
 
+#endif

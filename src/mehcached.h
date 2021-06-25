@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __MEMCACHED_H__
+#define __MEMCACHED_H__
+
 #pragma once
 
-#include "table.c"
-#include "alloc_pool.c"
-#include "alloc_malloc.c"
-#include "alloc_dynamic.c"
+// #include "table.c"
+// #include "alloc_pool.c"
+// #include "alloc_malloc.c"
+// #include "alloc_dynamic.c"
 
+#endif

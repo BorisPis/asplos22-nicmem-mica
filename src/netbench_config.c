@@ -22,6 +22,7 @@ struct mehcached_server_conf *
 mehcached_get_server_conf(const char *filename, const char *server_name)
 {
 	FILE *fp = fopen(filename, "r");
+	fprintf(stderr, "reading server conf: %s\n", filename);
 	if (!fp)
 	{
 		fprintf(stderr, "cannot open %s\n", filename);

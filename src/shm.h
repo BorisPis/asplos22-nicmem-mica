@@ -12,11 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __SHM_H__
+#define __SHM_H__
+
 #pragma once
 
 #include "common.h"
+#include <linux/limits.h>
 
 MEHCACHED_BEGIN
+
+struct mehcached_shm_page
+{
+	char path[PATH_MAX];
+	void *addr;
+	void *paddr;
+	size_t numa_node;
+	size_t in_use;
+};
+
+void mehcached_shm_set_dma_map(int flag);
+
+void
+mehcached_shm_map_all(int port_id);
 
 size_t
 mehcached_shm_adjust_size(size_t size);
@@ -33,13 +51,13 @@ mehcached_shm_find_free_address(size_t size);
 size_t
 mehcached_shm_alloc(size_t length, size_t numa_node);
 
-bool
+int
 mehcached_shm_schedule_remove(size_t entry_id);
 
-bool
+int
 mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length);
 
-bool
+int
 mehcached_shm_unmap(void *ptr);
 
 size_t
@@ -65,3 +83,4 @@ mehcached_shm_free_striped(void *ptr);
 
 MEHCACHED_END
 
+#endif

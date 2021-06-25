@@ -16,6 +16,8 @@
 
 #include "alloc_dynamic.h"
 #include "table.h"
+#include "util.h"
+#include <assert.h>
 
 MEHCACHED_BEGIN
 
@@ -29,9 +31,9 @@ MEHCACHED_BEGIN
 // TODO: use address order for each freelist to reduce fragmentation and improve locality
 // TODO: use the LSB (not MSB) to store status as all sizes are aligned to 8-byte boundary
 
-static
+
 void
-mehcached_dynamic_init(struct mehcached_dynamic *alloc, uint64_t size, bool concurrent_alloc_read, bool concurrent_alloc_write, size_t numa_node)
+mehcached_dynamic_init(struct mehcached_dynamic *alloc, uint64_t size, int concurrent_alloc_read, int concurrent_alloc_write, size_t numa_node)
 {
     if (!concurrent_alloc_read)
         alloc->concurrent_access_mode = 0;
@@ -51,13 +53,13 @@ mehcached_dynamic_init(struct mehcached_dynamic *alloc, uint64_t size, bool conc
     if (shm_id == (size_t)-1)
     {
         printf("failed to allocate memory\n");
-        assert(false);
+        assert(0);
     }
-    while (true)
+    while (1)
     {
         alloc->data = mehcached_shm_find_free_address(size);
         if (alloc->data == NULL)
-            assert(false);
+            assert(0);
 
         if (!mehcached_shm_map(shm_id, alloc->data, 0, size))
             continue;
@@ -68,21 +70,21 @@ mehcached_dynamic_init(struct mehcached_dynamic *alloc, uint64_t size, bool conc
     if (!mehcached_shm_schedule_remove(shm_id))
     {
         perror("");
-        assert(false);
+        assert(0);
     }
 
     mehcached_dynamic_reset(alloc);
 }
 
-static
+
 void
 mehcached_dynamic_free(struct mehcached_dynamic *alloc)
 {
     if (!mehcached_shm_unmap(alloc->data))
-        assert(false);
+        assert(0);
 }
 
-static
+
 void
 mehcached_dynamic_lock(struct mehcached_dynamic *alloc MEHCACHED_UNUSED)
 {
@@ -98,7 +100,7 @@ mehcached_dynamic_lock(struct mehcached_dynamic *alloc MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 void
 mehcached_dynamic_unlock(struct mehcached_dynamic *alloc MEHCACHED_UNUSED)
 {
@@ -113,7 +115,7 @@ mehcached_dynamic_unlock(struct mehcached_dynamic *alloc MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 size_t
 mehcached_dynamic_size_to_class_roundup(uint64_t size)
 {
@@ -125,7 +127,7 @@ mehcached_dynamic_size_to_class_roundup(uint64_t size)
         return MEHCACHED_DYNAMIC_NUM_CLASSES - 1;
 }
 
-static
+
 size_t
 mehcached_dynamic_size_to_class_rounddown(uint64_t size)
 {
@@ -138,7 +140,7 @@ mehcached_dynamic_size_to_class_rounddown(uint64_t size)
         return MEHCACHED_DYNAMIC_NUM_CLASSES - 1;
 }
 
-static
+
 void
 mehcached_dynamic_insert_free_chunk(struct mehcached_dynamic *alloc, uint8_t *chunk_start, uint64_t chunk_size)
 {
@@ -159,7 +161,7 @@ mehcached_dynamic_insert_free_chunk(struct mehcached_dynamic *alloc, uint8_t *ch
     alloc->free_head[chunk_class] = chunk_start;    // set as a new head
 }
 
-static
+
 void mehcached_dynamic_remove_free_chunk_from_free_list(struct mehcached_dynamic *alloc, uint8_t *chunk_start, uint64_t chunk_size)
 {
 #ifdef MEHCACHED_VERBOSE
@@ -182,8 +184,8 @@ void mehcached_dynamic_remove_free_chunk_from_free_list(struct mehcached_dynamic
         *(uint8_t **)(next_chunk_start + 8) = prev_chunk_start;
 }
 
-static
-bool
+
+int
 mehcached_dynamic_remove_free_chunk_from_head(struct mehcached_dynamic *alloc, uint64_t minimum_chunk_size, uint8_t **out_chunk_start, uint64_t *out_chunk_size)
 {
     size_t chunk_class = mehcached_dynamic_size_to_class_roundup(minimum_chunk_size);
@@ -198,7 +200,7 @@ mehcached_dynamic_remove_free_chunk_from_head(struct mehcached_dynamic *alloc, u
 #ifdef MEHCACHED_VERBOSE
         printf("mehcached_dynamic_remove_free_chunk_from_head: minsize=%lu no space\n", minimum_chunk_size);
 #endif
-        return false;
+        return 0;
     }
 
     // use the first free chunk in the class; the overall policy is still approximately best fit (which is good) due to segregation
@@ -216,10 +218,10 @@ mehcached_dynamic_remove_free_chunk_from_head(struct mehcached_dynamic *alloc, u
 #ifdef MEHCACHED_VERBOSE
     printf("mehcached_dynamic_remove_free_chunk_from_head: minsize=%lu start=%p size=%lu\n", minimum_chunk_size, *out_chunk_start, *out_chunk_size);
 #endif
-    return true;
+    return 1;
 }
 
-static
+
 void
 mehcached_dynamic_reset(struct mehcached_dynamic *alloc)
 {
@@ -229,14 +231,14 @@ mehcached_dynamic_reset(struct mehcached_dynamic *alloc)
     mehcached_dynamic_insert_free_chunk(alloc, alloc->data, alloc->size);
 }
 
-static
+
 struct mehcached_alloc_item *
 mehcached_dynamic_item(const struct mehcached_dynamic *alloc, uint64_t dynamic_offset)
 {
     return (struct mehcached_alloc_item *)(alloc->data + dynamic_offset);
 }
 
-static
+
 void
 mehcached_dynamic_coalese_free_chunk_left(struct mehcached_dynamic *alloc, uint8_t **chunk_start, uint64_t *chunk_size)
 {
@@ -260,7 +262,7 @@ mehcached_dynamic_coalese_free_chunk_left(struct mehcached_dynamic *alloc, uint8
     *chunk_size = *chunk_size + adj_chunk_size;
 }
 
-static
+
 void
 mehcached_dynamic_coalese_free_chunk_right(struct mehcached_dynamic *alloc, uint8_t **chunk_start, uint64_t *chunk_size)
 {
@@ -284,7 +286,7 @@ mehcached_dynamic_coalese_free_chunk_right(struct mehcached_dynamic *alloc, uint
     *chunk_size = *chunk_size + adj_chunk_size;
 }
 
-static
+
 uint64_t
 mehcached_dynamic_allocate(struct mehcached_dynamic *alloc, uint32_t item_size)
 {
@@ -322,7 +324,7 @@ mehcached_dynamic_allocate(struct mehcached_dynamic *alloc, uint32_t item_size)
     return (uint64_t)((uint8_t *)alloc_item - alloc->data);
 }
 
-static
+
 void
 mehcached_dynamic_deallocate(struct mehcached_dynamic *alloc, uint64_t dynamic_offset)
 {

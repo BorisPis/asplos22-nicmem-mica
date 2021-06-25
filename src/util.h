@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __UTIL_H__
+#define __UTIL_H__
+
 #pragma once
 
 #include "common.h"
@@ -34,6 +37,7 @@
 #define MEHCACHED_ROUNDUP4K(x) (((x) + 4095UL) & (~4095UL))
 #define MEHCACHED_ROUNDUP1M(x) (((x) + 1048575UL) & (~1048575UL))
 #define MEHCACHED_ROUNDUP2M(x) (((x) + 2097151UL) & (~2097151UL))
+#define MEHCACHED_ROUNDUP1G(x) (((x) + 1073741823UL) & (~1073741823UL))
 
 MEHCACHED_BEGIN
 
@@ -92,42 +96,42 @@ mehcached_memcpy8(uint8_t *dest, const uint8_t *src, size_t length)
 }
 
 static
-bool
+int
 mehcached_memcmp8(const uint8_t *dest, const uint8_t *src, size_t length)
 {
     length = MEHCACHED_ROUNDUP8(length);
     switch (length >> 3)
     {
         case 0:
-            return true;
+            return 1;
         case 1:
             if (*(const uint64_t *)(dest + 0) != *(const uint64_t *)(src + 0))
-                return false;
-            return true;
+                return 0;
+            return 1;
         case 2:
             if (*(const uint64_t *)(dest + 0) != *(const uint64_t *)(src + 0))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 8) != *(const uint64_t *)(src + 8))
-                return false;
-            return true;
+                return 0;
+            return 1;
         case 3:
             if (*(const uint64_t *)(dest + 0) != *(const uint64_t *)(src + 0))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 8) != *(const uint64_t *)(src + 8))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 16) != *(const uint64_t *)(src + 16))
-                return false;
-            return true;
+                return 0;
+            return 1;
         case 4:
             if (*(const uint64_t *)(dest + 0) != *(const uint64_t *)(src + 0))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 8) != *(const uint64_t *)(src + 8))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 16) != *(const uint64_t *)(src + 16))
-                return false;
+                return 0;
             if (*(const uint64_t *)(dest + 24) != *(const uint64_t *)(src + 24))
-                return false;
-            return true;
+                return 0;
+            return 1;
         default:
             return memcmp(dest, src, length) == 0;
     }
@@ -215,3 +219,4 @@ rte_eal_launch(lcore_function_t *f, void *arg, unsigned int core_id)
 
 MEHCACHED_END
 
+#endif

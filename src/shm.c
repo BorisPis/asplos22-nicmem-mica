@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common.h"
 #include "shm.h"
 
 #include "util.h"
@@ -27,18 +28,11 @@
 #ifdef USE_DPDK
 #include <rte_lcore.h>
 #include <rte_debug.h>
+#include <rte_dev.h>
+#include <rte_ethdev.h>
 #endif
 
 MEHCACHED_BEGIN
-
-struct mehcached_shm_page
-{
-	char path[PATH_MAX];
-	void *addr;
-	void *paddr;
-	size_t numa_node;
-	size_t in_use;
-};
 
 struct mehcached_shm_entry
 {
@@ -61,6 +55,9 @@ struct mehcached_shm_mapping
 #define MEHCACHED_SHM_MAX_PAGES (65536)
 #define MEHCACHED_SHM_MAX_ENTRIES (8192)
 #define MEHCACHED_SHM_MAX_MAPPINGS (16384)
+// #define MEHCACHED_SHM_MAX_PAGES (64)
+// #define MEHCACHED_SHM_MAX_ENTRIES (16)
+// #define MEHCACHED_SHM_MAX_MAPPINGS (32)
 
 static size_t mehcached_shm_page_size;
 static uint64_t mehcached_shm_state_lock;
@@ -68,13 +65,46 @@ static struct mehcached_shm_page mehcached_shm_pages[MEHCACHED_SHM_MAX_PAGES];
 static struct mehcached_shm_entry mehcached_shm_entries[MEHCACHED_SHM_MAX_ENTRIES];
 static struct mehcached_shm_mapping mehcached_shm_mappings[MEHCACHED_SHM_MAX_MAPPINGS];
 static size_t mehcached_shm_used_memory;
+static int mehcached_shm_dma_map = 0;
 
 static const char *mehcached_shm_path_prefix = "/mnt/huge/mehcached_shm_";
+
+void mehcached_shm_set_dma_map(int flag) {
+	mehcached_shm_dma_map = flag;
+}
 
 size_t
 mehcached_shm_adjust_size(size_t size)
 {
     return (uint64_t)MEHCACHED_ROUNDUP2M(size);
+    // return (uint64_t)MEHCACHED_ROUNDUP1G(size);
+}
+
+void mehcached_shm_map_all(int port_id)
+{
+	size_t page_id;
+	int ret;
+
+	for (page_id = 0; page_id < MEHCACHED_SHM_MAX_PAGES; page_id++)
+	{
+		if (mehcached_shm_pages[page_id].addr == NULL)
+			continue;
+		printf("page %zu: addr=%p end=%p\n", page_id, mehcached_shm_pages[page_id].addr, mehcached_shm_pages[page_id].addr+mehcached_shm_page_size);
+		ret = rte_extmem_register(mehcached_shm_pages[page_id].addr,
+					  mehcached_shm_page_size,
+					  NULL,
+					  1,
+					  mehcached_shm_page_size);
+		if (ret)
+			rte_exit(EXIT_FAILURE,
+				 "external memory registration failed %d\n", page_id);
+		ret = rte_dev_dma_map(rte_eth_devices[0].device,
+				      mehcached_shm_pages[page_id].addr,
+				      NULL, mehcached_shm_page_size);
+		if (ret)
+			rte_exit(EXIT_FAILURE,
+				 "DMA map of host mem failed %d\n", page_id);
+	}
 }
 
 static
@@ -206,9 +236,9 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 
 	printf("initial allocation of %zu pages\n", num_allocated_pages);
 
-    // sort by virtual address
+	// sort by virtual address
 	printf("sorting by virtual address\n");
-    qsort(mehcached_shm_pages, num_allocated_pages, sizeof(struct mehcached_shm_page), mehcached_shm_compare_vaddr);
+	qsort(mehcached_shm_pages, num_allocated_pages, sizeof(struct mehcached_shm_page), mehcached_shm_compare_vaddr);
 
 	// detect numa socket
 	printf("detecting NUMA mapping\n");
@@ -244,7 +274,7 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 					printf("warning: page count for %p is expected to be 1\n", (void *)addr);
 
 				mehcached_shm_pages[page_id].numa_node = numa_node;
-				//printf("%p is on numa node %zu\n", p, numa_node);
+				// printf("%p is on numa node %zu\n", p, numa_node);
 				page_id++;
 			}
 		}
@@ -256,11 +286,11 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 		assert(false);
 	}
 
-    // get physical address (pagemap.txt)
+	// get physical address (pagemap.txt)
 	printf("detecting physical address of pages\n");
-    size_t normal_page_size = (size_t)getpagesize();
+	size_t normal_page_size = (size_t)getpagesize();
 	int fd = open("/proc/self/pagemap", O_RDONLY);
-    if (fd == -1)
+	if (fd == -1)
 	{
 		perror("");
 		assert(false);
@@ -268,45 +298,45 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 
 	for (page_id = 0; page_id < num_allocated_pages; page_id++)
 	{
-        size_t pfn = (size_t)mehcached_shm_pages[page_id].addr / normal_page_size;
-        off_t offset = (off_t)(sizeof(uint64_t) * pfn);
+		size_t pfn = (size_t)mehcached_shm_pages[page_id].addr / normal_page_size;
+		off_t offset = (off_t)(sizeof(uint64_t) * pfn);
 
 		if (lseek(fd, offset, SEEK_SET) != offset)
-        {
-            perror("");
-            close(fd);
-            assert(false);
+		{
+			perror("");
+			close(fd);
+			assert(false);
 		}
 
-        uint64_t entry;
+		uint64_t entry;
 		if (read(fd, &entry, sizeof(uint64_t)) == -1)
-        {
-            perror("");
-            close(fd);
-            assert(false);
+		{
+			perror("");
+			close(fd);
+			assert(false);
 		}
 
-        mehcached_shm_pages[page_id].paddr = (void *)((entry & 0x7fffffffffffffULL) * normal_page_size);
-        //printf("virtual addr %p = physical addr %p\n", mehcached_shm_pages[page_id].addr, mehcached_shm_pages[page_id].paddr);
-    }
+		mehcached_shm_pages[page_id].paddr = (void *)((entry & 0x7fffffffffffffULL) * normal_page_size);
+		//printf("virtual addr %p = physical addr %p\n", mehcached_shm_pages[page_id].addr, mehcached_shm_pages[page_id].paddr);
+	}
 
-    // sort by physical address
+	// sort by physical address
 	printf("sorting by physical address\n");
-    // for (page_id = 0; page_id < num_allocated_pages - 1; page_id++)
-    // {
-    //     size_t page_id2;
-    //     for (page_id2 = page_id + 1; page_id2 < num_allocated_pages; page_id2++)
-    //     {
-    //         if (mehcached_shm_pages[page_id].paddr > mehcached_shm_pages[page_id2].paddr)
-    //         {
-    //             struct mehcached_shm_page t;
-    //             memcpy(&t, &mehcached_shm_pages[page_id], sizeof(struct mehcached_shm_page));
-    //             memcpy(&mehcached_shm_pages[page_id], &mehcached_shm_pages[page_id2], sizeof(struct mehcached_shm_page));
-    //             memcpy(&mehcached_shm_pages[page_id2], &t, sizeof(struct mehcached_shm_page));
-    //         }
-    //     }
-    // }
-    qsort(mehcached_shm_pages, num_allocated_pages, sizeof(struct mehcached_shm_page), mehcached_shm_compare_paddr);
+	// for (page_id = 0; page_id < num_allocated_pages - 1; page_id++)
+	// {
+	//     size_t page_id2;
+	//     for (page_id2 = page_id + 1; page_id2 < num_allocated_pages; page_id2++)
+	//     {
+	//         if (mehcached_shm_pages[page_id].paddr > mehcached_shm_pages[page_id2].paddr)
+	//         {
+	//             struct mehcached_shm_page t;
+	//             memcpy(&t, &mehcached_shm_pages[page_id], sizeof(struct mehcached_shm_page));
+	//             memcpy(&mehcached_shm_pages[page_id], &mehcached_shm_pages[page_id2], sizeof(struct mehcached_shm_page));
+	//             memcpy(&mehcached_shm_pages[page_id2], &t, sizeof(struct mehcached_shm_page));
+	//         }
+	//     }
+	// }
+	qsort(mehcached_shm_pages, num_allocated_pages, sizeof(struct mehcached_shm_page), mehcached_shm_compare_paddr);
 
 	// throw away surplus pages on each numa node
 	printf("releasing unnecessary pages\n");
@@ -319,16 +349,16 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 	for (page_id = 0; page_id < num_allocated_pages; page_id++)
 	{
 		size_t numa_node = mehcached_shm_pages[page_id].numa_node;
-        void *addr = mehcached_shm_pages[page_id].addr;
+		void *addr = mehcached_shm_pages[page_id].addr;
 		if (num_reserved_pages[numa_node] < num_pages_per_numa_node)
-        {
-            //printf("reserving page (addr=%p, paddr=%p, numa_node=%zu)\n", addr, mehcached_shm_pages[page_id].paddr, numa_node);
-			num_reserved_pages[numa_node]++;
-            //memset(addr, 0, mehcached_shm_page_size);
-        }
-        else
 		{
-			//printf("deallocating surplus page %p on numa node %zu\n", addr, numa_node);
+			// printf("reserving page (addr=%p, paddr=%p, numa_node=%zu)\n", addr, mehcached_shm_pages[page_id].paddr, numa_node);
+			num_reserved_pages[numa_node]++;
+			//memset(addr, 0, mehcached_shm_page_size);
+		}
+		else
+		{
+			// printf("deallocating surplus page %p on numa node %zu\n", addr, numa_node);
 
 			munmap(addr, mehcached_shm_page_size);
 			unlink(mehcached_shm_pages[page_id].path);
@@ -454,6 +484,7 @@ mehcached_shm_alloc(size_t length, size_t numa_node)
 	}
 	if (num_pages != num_allocated_pages)
 	{
+		printf("allocated pages %llu num_pages %llu\n", num_allocated_pages, num_pages);
 		printf("insufficient memory on numa node %zu to allocate %zu bytes\n", numa_node, length);
 		free(mehcached_shm_entries[entry_id].pages);
 		memset(&mehcached_shm_entries[entry_id], 0, sizeof(mehcached_shm_entries[entry_id]));
@@ -498,14 +529,15 @@ mehcached_shm_check_remove(size_t entry_id)
 	}
 }
 
-bool
+int
 mehcached_shm_schedule_remove(size_t entry_id)
 {
 	mehcached_shm_lock();
 
 	if (mehcached_shm_entries[entry_id].pages == NULL)
 	{
-		printf("invalid entry\n");
+		printf("invalid entry %d %s\n", entry_id, __func__);
+		rte_exit(EXIT_FAILURE, "");
 		mehcached_shm_unlock();
 		return false;
 	}
@@ -517,7 +549,7 @@ mehcached_shm_schedule_remove(size_t entry_id)
 	return true;
 }
 
-bool
+int
 mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length)
 {
 	if (((size_t)ptr & ~(mehcached_shm_page_size - 1)) != (size_t)ptr)
@@ -537,7 +569,8 @@ mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length)
 	// check entry
 	if (mehcached_shm_entries[entry_id].pages == NULL)
 	{
-		printf("invalid entry\n");
+		printf("invalid entry %d %s\n", entry_id, __func__);
+		rte_exit(EXIT_FAILURE, "");
 		mehcached_shm_unlock();
 		return false;
 	}
@@ -635,11 +668,29 @@ mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length)
 #ifndef NDEBUG
 	printf("created new mapping %zu (shm entry %zu, page_offset=%zu, num_pages=%zu) at %p\n", mapping_id, entry_id, page_offset, num_pages, ptr);
 #endif
+	if (mehcached_shm_dma_map) {
+		printf("created new mapping %zu (shm entry %zu, page_offset=%zu, num_pages=%zu) at %p--%p\n", mapping_id, entry_id, page_offset, num_pages, ptr, ptr+length);
+		int ret;
+		ret = rte_extmem_register(ptr,
+					  length,
+					  NULL,
+					  length / mehcached_shm_page_size,
+					  mehcached_shm_page_size);
+		if (ret)
+			rte_exit(EXIT_FAILURE,
+				 "%s external memory registration failed %p\n", __func__, ptr);
+		ret = rte_dev_dma_map(rte_eth_devices[0].device,
+				      ptr,
+				      NULL, length);
+		if (ret)
+			rte_exit(EXIT_FAILURE,
+				 "%s DMA map of host mem failed %p\n", __func__, ptr);
+	}
 
 	return true;
 }
 
-bool
+int
 mehcached_shm_unmap(void *ptr)
 {
 	mehcached_shm_lock();
@@ -701,7 +752,8 @@ mehcached_shm_malloc_contiguous(size_t size, size_t lcore)
     size = mehcached_shm_adjust_size(size);
     // size_t entry_id = mehcached_shm_alloc(size, (size_t)-1);
     // size_t entry_id = mehcached_shm_alloc(size, numa_node);
-    size_t entry_id = mehcached_shm_alloc(size, rte_lcore_to_socket_id((unsigned int)lcore));
+    // size_t entry_id = mehcached_shm_alloc(size, rte_lcore_to_socket_id((unsigned int)lcore));
+    size_t entry_id = mehcached_shm_alloc(size, 0);
     if (entry_id == (size_t)-1)
     	return NULL;
     while (true)
@@ -753,6 +805,7 @@ mehcached_shm_malloc_striped(size_t size)
     // TODO: allocate 1 fewer page (i.e., only 1 page in total) when the total number of pages required is an odd numbered
 
     size_t entry_id[2];
+    printf("rte_socket_id %d\n", rte_socket_id());
     entry_id[0] = mehcached_shm_alloc(size_2, rte_socket_id());
     if (entry_id[0] == (size_t)-1)
         return NULL;

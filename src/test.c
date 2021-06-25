@@ -37,7 +37,7 @@ test_basic()
         uint64_t key_hash = hash((const uint8_t *)&key, sizeof(key));
         //printf("add key = %zu, value = %zu, key_hash = %lx\n", key, value, key_hash);
 
-        if (!mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, false))
+        if (!mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, false, -1))
             assert(false);
     }
     for (i = 0; i < MEHCACHED_ITEMS_PER_BUCKET; i++)
@@ -47,7 +47,7 @@ test_basic()
         uint64_t key_hash = hash((const uint8_t *)&key, sizeof(key));
         //printf("set key = %zu, value = %zu, key_hash = %lx\n", key, value, key_hash);
 
-        if (!mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, true))
+        if (!mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, true, -1))
             assert(false);
     }
 
@@ -58,7 +58,7 @@ test_basic()
         uint64_t key_hash = hash((const uint8_t *)&key, sizeof(key));
 
         size_t value_length = sizeof(value);
-        if (!mehcached_get(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (uint8_t *)&value, &value_length, NULL, false))
+        if (!mehcached_get(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (uint8_t *)&value, &value_length, NULL, false, true, NULL))
         {
             printf("get key = %zu, value = <not found>\n", key);
             continue;

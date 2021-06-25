@@ -15,8 +15,11 @@
 #pragma once
 
 #include "table.h"
+#include "alloc_pool.h"
+#include "alloc_dynamic.h"
 #include "util.h"
 #include "shm.h"
+#include <rte_ethdev.h>
 
 #include <stdio.h>
 
@@ -25,7 +28,7 @@ MEHCACHED_BEGIN
 // a test feature to deduplicate PUT requests within the same batch
 //#define MEHCACHED_DEDUP_WITHIN_BATCH
 
-static
+
 void
 mehcached_print_bucket(const struct mehcached_bucket *bucket)
 {
@@ -35,7 +38,7 @@ mehcached_print_bucket(const struct mehcached_bucket *bucket)
         printf("  item_vec[%zu]: tag=%lu, alloc_id=%lu, item_offset=%lu\n", item_index, MEHCACHED_TAG(bucket->item_vec[item_index]), MEHCACHED_ALLOC_ID(bucket->item_vec[item_index]), MEHCACHED_ITEM_OFFSET(bucket->item_vec[item_index]));
 }
 
-static
+
 void
 mehcached_print_buckets(const struct mehcached_table *table)
 {
@@ -48,7 +51,7 @@ mehcached_print_buckets(const struct mehcached_table *table)
     printf("\n");
 }
 
-static
+
 void
 mehcached_print_stats(const struct mehcached_table *table MEHCACHED_UNUSED)
 {
@@ -69,7 +72,7 @@ mehcached_print_stats(const struct mehcached_table *table MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 void
 mehcached_reset_table_stats(struct mehcached_table *table MEHCACHED_UNUSED)
 {
@@ -80,7 +83,7 @@ mehcached_reset_table_stats(struct mehcached_table *table MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 uint32_t
 mehcached_calc_bucket_index(const struct mehcached_table *table, uint64_t key_hash)
 {
@@ -88,7 +91,7 @@ mehcached_calc_bucket_index(const struct mehcached_table *table, uint64_t key_ha
     return (uint32_t)(key_hash >> 16) & table->num_buckets_mask;
 }
 
-static
+
 uint16_t
 mehcached_calc_tag(uint64_t key_hash)
 {
@@ -99,7 +102,7 @@ mehcached_calc_tag(uint64_t key_hash)
         return tag;
 }
 
-static
+
 // uint64_t
 uint32_t
 mehcached_read_version_begin(const struct mehcached_table *table MEHCACHED_UNUSED, const struct mehcached_bucket *bucket MEHCACHED_UNUSED)
@@ -107,7 +110,7 @@ mehcached_read_version_begin(const struct mehcached_table *table MEHCACHED_UNUSE
 #ifdef MEHCACHED_CONCURRENT
     if (table->concurrent_access_mode != 0)
     {
-        while (true)
+        while (1)
         {
             // uint64_t v = *(volatile uint64_t *)&bucket->version;
             uint32_t v = *(volatile uint32_t *)&bucket->version;
@@ -127,7 +130,7 @@ mehcached_read_version_begin(const struct mehcached_table *table MEHCACHED_UNUSE
 #endif
 }
 
-static
+
 //uint64_t
 uint32_t
 mehcached_read_version_end(const struct mehcached_table *table MEHCACHED_UNUSED, const struct mehcached_bucket *bucket MEHCACHED_UNUSED)
@@ -149,7 +152,7 @@ mehcached_read_version_end(const struct mehcached_table *table MEHCACHED_UNUSED,
 #endif
 }
 
-static
+
 void
 mehcached_lock_bucket(const struct mehcached_table *table MEHCACHED_UNUSED, struct mehcached_bucket *bucket MEHCACHED_UNUSED)
 {
@@ -178,7 +181,7 @@ mehcached_lock_bucket(const struct mehcached_table *table MEHCACHED_UNUSED, stru
 #endif
 }
 
-static
+
 void
 mehcached_unlock_bucket(const struct mehcached_table *table MEHCACHED_UNUSED, struct mehcached_bucket *bucket MEHCACHED_UNUSED)
 {
@@ -195,7 +198,7 @@ mehcached_unlock_bucket(const struct mehcached_table *table MEHCACHED_UNUSED, st
 #endif
 }
 
-static
+
 void
 mehcached_lock_extra_bucket_free_list(struct mehcached_table *table)
 {
@@ -211,7 +214,7 @@ mehcached_lock_extra_bucket_free_list(struct mehcached_table *table)
 #endif
 }
 
-static
+
 void
 mehcached_unlock_extra_bucket_free_list(struct mehcached_table *table)
 {
@@ -226,18 +229,18 @@ mehcached_unlock_extra_bucket_free_list(struct mehcached_table *table)
 #endif
 }
 
-static
-bool
+
+int
 mehcached_has_extra_bucket(struct mehcached_bucket *bucket MEHCACHED_UNUSED)
 {
 #ifndef MEHCACHED_NO_EVICTION
-    return false;
+    return 0;
 #else
     return bucket->next_extra_bucket_index != 0;
 #endif
 }
 
-static
+
 struct mehcached_bucket *
 mehcached_extra_bucket(const struct mehcached_table *table, uint32_t extra_bucket_index)
 {
@@ -247,8 +250,8 @@ mehcached_extra_bucket(const struct mehcached_table *table, uint32_t extra_bucke
     return table->extra_buckets + extra_bucket_index;   // extra_buckets[1] is the actual start
 }
 
-static
-bool
+
+int
 mehcached_alloc_extra_bucket(struct mehcached_table *table, struct mehcached_bucket *bucket)
 {
     assert(!mehcached_has_extra_bucket(bucket));
@@ -258,7 +261,7 @@ mehcached_alloc_extra_bucket(struct mehcached_table *table, struct mehcached_buc
     if (table->extra_bucket_free_list.head == 0)
     {
         mehcached_unlock_extra_bucket_free_list(table);
-        return false;
+        return 0;
     }
 
     // take the first free extra bucket
@@ -271,10 +274,10 @@ mehcached_alloc_extra_bucket(struct mehcached_table *table, struct mehcached_buc
     bucket->next_extra_bucket_index = extra_bucket_index;
 
     mehcached_unlock_extra_bucket_free_list(table);
-    return true;
+    return 1;
 }
 
-static
+
 void
 mehcached_free_extra_bucket(struct mehcached_table *table, struct mehcached_bucket *bucket)
 {
@@ -302,7 +305,7 @@ mehcached_free_extra_bucket(struct mehcached_table *table, struct mehcached_buck
     mehcached_unlock_extra_bucket_free_list(table);
 }
 
-static
+
 void
 mehcached_fill_hole(struct mehcached_table *table, struct mehcached_bucket *bucket, size_t unused_item_index)
 {
@@ -318,7 +321,7 @@ mehcached_fill_hole(struct mehcached_table *table, struct mehcached_bucket *buck
         current_extra_bucket = mehcached_extra_bucket(table, current_extra_bucket->next_extra_bucket_index);
     }
 
-    bool last_item = true;
+    int last_item = 1;
     size_t moved_item_index;
 
     size_t item_index;
@@ -332,7 +335,7 @@ mehcached_fill_hole(struct mehcached_table *table, struct mehcached_bucket *buck
     for (item_index++; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
         if (current_extra_bucket->item_vec[item_index] != 0)
         {
-            last_item = false;
+            last_item = 0;
             break;
         }
 
@@ -345,12 +348,12 @@ mehcached_fill_hole(struct mehcached_table *table, struct mehcached_bucket *buck
         mehcached_free_extra_bucket(table, prev_extra_bucket);
 }
 
-static
+
 size_t
 mehcached_find_empty(struct mehcached_table *table, struct mehcached_bucket *bucket, struct mehcached_bucket **located_bucket)
 {
     struct mehcached_bucket *current_bucket = bucket;
-    while (true)
+    while (1)
     {
         size_t item_index;
         for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
@@ -380,13 +383,13 @@ mehcached_find_empty(struct mehcached_table *table, struct mehcached_bucket *buc
     }
 }
 
-static
+
 size_t
 mehcached_find_empty_or_oldest(const struct mehcached_table *table, struct mehcached_bucket *bucket, struct mehcached_bucket **located_bucket)
 {
 #if defined(MEHCACHED_ALLOC_MALLOC) || defined(MEHCACHED_ALLOC_DYNAMIC)
     // this code should be reachable because we can now use MEHCACHED_NO_EVICTION
-    assert(false);
+    assert(0);
 #endif
 
 #ifdef MEHCACHED_ALLOC_POOL
@@ -396,7 +399,7 @@ mehcached_find_empty_or_oldest(const struct mehcached_table *table, struct mehca
 #endif
 
     struct mehcached_bucket *current_bucket = bucket;
-    while (true)
+    while (1)
     {
         size_t item_index;
         for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
@@ -429,52 +432,92 @@ mehcached_find_empty_or_oldest(const struct mehcached_table *table, struct mehca
 #if defined(MEHCACHED_ALLOC_MALLOC) || defined(MEHCACHED_ALLOC_DYNAMIC)
     // XXX: getting oldest item is unclear with malloc; just pick anything
     *located_bucket = current_bucket;
-    static size_t v = 0;    // XXX: this is slow with multiple threads!
+     size_t v = 0;    // XXX: this is slow with multiple threads!
     size_t item_index = (v++) % MEHCACHED_ITEMS_PER_BUCKET;
     return item_index;
 #endif
 }
 
-static
-void
-mehcached_set_item(struct mehcached_item *item, uint64_t key_hash, const uint8_t *key, uint32_t key_length, const uint8_t *value, uint32_t value_length, uint32_t expire_time)
-{
-    assert(key_length <= MEHCACHED_KEY_MASK);
-    assert(value_length <= MEHCACHED_VALUE_MASK);
 
-    item->kv_length_vec = MEHCACHED_KV_LENGTH_VEC(key_length, value_length);
-    item->key_hash = key_hash;
-    item->expire_time = expire_time;
-    mehcached_memcpy8(item->data, key, key_length);
-    mehcached_memcpy8(item->data + MEHCACHED_ROUNDUP8(key_length), value, value_length);
+void
+mehcached_set_item(struct mehcached_item *item, uint64_t key_hash, const uint8_t *key, uint32_t key_length, const uint8_t *value, uint32_t value_length, uint32_t expire_time, struct mehcached_alloc_item *extptr, uintptr_t nicptr)
+{
+	assert(key_length <= MEHCACHED_KEY_MASK);
+	assert(value_length <= MEHCACHED_VALUE_MASK);
+
+	item->alloc_item.refcount = 1;
+	item->alloc_item.valid = 1;
+	item->alloc_item.nicmem = 0;
+	item->kv_length_vec = MEHCACHED_KV_LENGTH_VEC(key_length, value_length);
+	item->key_hash = key_hash;
+	item->expire_time = expire_time;
+	mehcached_memcpy8(item->data, key, key_length);
+	mehcached_memcpy8(item->data + MEHCACHED_ROUNDUP8(key_length), value, value_length);
+	if (extptr) {
+		item->extptr = extptr;
+		extptr->refcount = 1;
+		extptr->valid = 1;
+		extptr->nicmem = (nicptr != SPLIT_MARKER);
+		if (extptr->nicmem) {
+			mehcached_memcpy8(extptr->data, &nicptr, sizeof(nicptr));
+			rte_eth_memcpy_to_dm(MEHCACHED_EXT_PORT_ID(nicptr), item->data + MEHCACHED_ROUNDUP8(key_length),
+					     MEHCACHED_EXT_OFFSET(nicptr), value_length);
+			// printf("copied %d off %d len %d\n", MEHCACHED_EXT_PORT_ID(nicptr),
+			//        MEHCACHED_EXT_OFFSET(nicptr), value_length);
+
+		} else {
+			// printf("no nicmem nicptr = %d\n", nicptr);
+			mehcached_memcpy8(extptr->data, value, value_length);
+		}
+	}
 }
 
-static
+
 void
 mehcached_set_item_value(struct mehcached_item *item, const uint8_t *value, uint32_t value_length, uint32_t expire_time)
 {
-    assert(value_length <= MEHCACHED_VALUE_MASK);
+	assert(value_length <= MEHCACHED_VALUE_MASK);
 
-    uint32_t key_length = MEHCACHED_KEY_LENGTH(item->kv_length_vec);
-    item->kv_length_vec = MEHCACHED_KV_LENGTH_VEC(key_length, value_length);
-    item->expire_time = expire_time;
-    mehcached_memcpy8(item->data + MEHCACHED_ROUNDUP8(key_length), value, value_length);
+	uint32_t key_length = MEHCACHED_KEY_LENGTH(item->kv_length_vec);
+	item->kv_length_vec = MEHCACHED_KV_LENGTH_VEC(key_length, value_length);
+	item->expire_time = expire_time;
+	mehcached_memcpy8(item->data + MEHCACHED_ROUNDUP8(key_length), value, value_length);
+	if (item->extptr) { // invalidate extptr
+		if (!item->extptr->valid || item->extptr->refcount == 1) {
+			item->extptr->valid = 1;
+			if (item->extptr->nicmem) {
+				uintptr_t nicptr;
+				mehcached_memcpy8(&nicptr, item->extptr->data, sizeof(nicptr));
+				// TODO: add memcpy to dm at nicptr
+				rte_eth_memcpy_to_dm(MEHCACHED_EXT_PORT_ID(nicptr), item->data + MEHCACHED_ROUNDUP8(key_length),
+						     MEHCACHED_EXT_OFFSET(nicptr), value_length);
+				// printf("copied 2 %d off %d len %d\n", MEHCACHED_EXT_PORT_ID(nicptr),
+				//        MEHCACHED_EXT_OFFSET(nicptr), value_length);
+			} else {
+				// printf("no nicmem nicptr \n");
+				mehcached_memcpy8(item->extptr->data, value, value_length);
+			}
+		} else {
+			item->extptr->valid = 0; // avoid using this item for further gets
+			// we will copy the data to extptr once refcount returns to 1
+		}
+	}
 }
 
-static
-bool
+
+int
 mehcached_compare_keys(const uint8_t *key1, size_t key1_len, const uint8_t *key2, size_t key2_len)
 {
     return key1_len == key2_len && mehcached_memcmp8(key1, key2, key1_len);
 }
 
-static
+
 size_t
 mehcached_find_item_index(const struct mehcached_table *table, struct mehcached_bucket *bucket, uint64_t key_hash, uint16_t tag, const uint8_t *key, size_t key_length, struct mehcached_bucket **located_bucket)
 {
     struct mehcached_bucket *current_bucket = bucket;
 
-    while (true)
+    while (1)
     {
         size_t item_index;
         for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
@@ -523,13 +566,13 @@ mehcached_find_item_index(const struct mehcached_table *table, struct mehcached_
     return MEHCACHED_ITEMS_PER_BUCKET;
 }
 
-static
+
 size_t
 mehcached_find_same_tag(const struct mehcached_table *table, struct mehcached_bucket *bucket, uint16_t tag, struct mehcached_bucket **located_bucket)
 {
     struct mehcached_bucket *current_bucket = bucket;
 
-    while (true)
+    while (1)
     {
         size_t item_index;
         for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
@@ -551,7 +594,7 @@ mehcached_find_same_tag(const struct mehcached_table *table, struct mehcached_bu
 }
 
 #ifdef MEHCACHED_ALLOC_POOL
-static
+
 void
 mehcached_cleanup_bucket(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t old_tail, uint64_t new_tail)
 {
@@ -572,7 +615,7 @@ mehcached_cleanup_bucket(uint8_t current_alloc_id, struct mehcached_table *table
         mehcached_lock_bucket(table, bucket);
 
         struct mehcached_bucket *current_bucket = bucket;
-        while (true)
+        while (1)
         {
             size_t item_index;
             for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
@@ -603,7 +646,7 @@ mehcached_cleanup_bucket(uint8_t current_alloc_id, struct mehcached_table *table
     }
 }
 
-static
+
 void
 mehcached_cleanup_all(uint8_t current_alloc_id, struct mehcached_table *table)
 {
@@ -612,7 +655,7 @@ mehcached_cleanup_all(uint8_t current_alloc_id, struct mehcached_table *table)
 }
 #endif
 
-static
+
 void
 mehcached_prefetch_table(struct mehcached_table *table, uint64_t key_hash, struct mehcached_prefetch_state *out_prefetch_state)
 {
@@ -633,7 +676,7 @@ mehcached_prefetch_table(struct mehcached_table *table, uint64_t key_hash, struc
     // XXX: prefetch extra buckets, too?
 }
 
-static
+
 void
 mehcached_prefetch_alloc(struct mehcached_prefetch_state *in_out_prefetch_state)
 {
@@ -666,9 +709,9 @@ mehcached_prefetch_alloc(struct mehcached_prefetch_state *in_out_prefetch_state)
     }
 }
 
-static
-bool
-mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint8_t *out_value, size_t *in_out_value_length, uint32_t *out_expire_time, bool readonly MEHCACHED_UNUSED)
+
+int
+mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint8_t *out_value, size_t *in_out_value_length, uint32_t *out_expire_time, int readonly MEHCACHED_UNUSED, int *copy, uintptr_t *pData, struct mehcached_item **oItem)
 {
     assert(key_length <= MEHCACHED_MAX_KEY_LENGTH);
 
@@ -677,10 +720,10 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
 
     struct mehcached_bucket *bucket = table->buckets + bucket_index;
 
-    bool partial_value;
+    int partial_value;
     uint32_t expire_time;
 
-    while (true)
+    while (1)
     {
         uint32_t version_start = mehcached_read_version_begin(table, bucket);
 
@@ -690,8 +733,9 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
         {
             if (version_start != mehcached_read_version_end(table, bucket))
                 continue;
+	    // printf("Missing bucket %p %d\n", bucket, bucket_index);
             MEHCACHED_STAT_INC(table, get_notfound);
-            return false;
+            return 0;
         }
 
         uint64_t item_vec = located_bucket->item_vec[item_index];
@@ -700,8 +744,10 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
 #ifdef MEHCACHED_ALLOC_POOL
         // we may read garbage data, but all operations relying on them are safe here
         uint64_t alloc_id = MEHCACHED_ALLOC_ID(item_vec);
-        if (alloc_id >= (uint64_t)table->alloc_id_mask + 1)   // fix-up for possible garbage read
+        if (alloc_id >= (uint64_t)table->alloc_id_mask + 1) {  // fix-up for possible garbage read
+	    printf("Warning! fixup alloc_id %d -> 0\n", alloc_id);
             alloc_id = 0;
+	}
         struct mehcached_item *item = (struct mehcached_item *)mehcached_pool_item(&table->alloc[alloc_id], item_offset);
 #endif
 #ifdef MEHCACHED_ALLOC_MALLOC
@@ -743,12 +789,42 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
         // adjust value length to use
         if (value_length > *in_out_value_length)
         {
-            partial_value = true;
+            partial_value = 1;
             value_length = *in_out_value_length;
         }
         else
-            partial_value = false;
-        mehcached_memcpy8(out_value, item->data + MEHCACHED_ROUNDUP8(key_length), value_length);
+            partial_value = 0;
+	if (*copy) {
+		mehcached_memcpy8(out_value, item->data + MEHCACHED_ROUNDUP8(key_length), value_length);
+	} else { // trying to zero copy
+		struct mehcached_alloc_item *ext = item->extptr;
+		if (ext && ext->valid) {
+			if (pData)
+				*pData = (uintptr_t)(ext->data);
+			// __sync_fetch_and_add((volatile uint32_t *)&ext->refcount, (volatile uint32_t)1);
+			ext->refcount++;
+			*oItem = item;
+		} else {
+			if (ext && ext->refcount == 1) { // we are the only users
+				if (ext->nicmem) {
+					uintptr_t nicptr;
+					mehcached_memcpy8(&nicptr, item->extptr->data, sizeof(nicptr));
+					rte_eth_memcpy_to_dm(MEHCACHED_EXT_PORT_ID(nicptr), item->data + MEHCACHED_ROUNDUP8(key_length),
+							     MEHCACHED_EXT_OFFSET(nicptr), value_length);
+				} else {
+					mehcached_memcpy8(ext->data, item->data + MEHCACHED_ROUNDUP8(key_length), value_length);
+				}
+
+				// __sync_fetch_and_add((volatile uint32_t *)&ext->refcount, (volatile uint32_t)1);
+				ext->refcount++;
+				*oItem = item;
+
+			} else { // extptr is still in use by previous gets; copy the value
+				mehcached_memcpy8(out_value, item->data + MEHCACHED_ROUNDUP8(key_length), value_length);
+				*copy = 1;
+			}
+		}
+	}
 
 #ifdef MEHCACHED_ALLOC_POOL
         if (!mehcached_pool_is_valid(&table->alloc[alloc_id], item_offset))
@@ -772,7 +848,7 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
             }
 
             MEHCACHED_STAT_INC(table, get_notfound);
-            return false;
+            return 0;
         }
 #endif
 
@@ -782,7 +858,7 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
 #ifndef NDEBUG
         // debug code to check how the code works when it read garbage values
         if (value_length > 1500)
-            assert(false);
+            assert(0);
 #endif
 
         *in_out_value_length = value_length;
@@ -803,7 +879,7 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
             // perform move-to-head within the same alloc only
 
             uint64_t distance_from_tail = (table->alloc[current_alloc_id].tail - item_offset) & table->alloc[current_alloc_id].mask;
-            if (distance_from_tail > table->mth_threshold)
+            if (distance_from_tail > table->mth_threshold && 0)
             {
                 mehcached_lock_bucket(table, bucket);
                 mehcached_pool_lock(&table->alloc[current_alloc_id]);
@@ -820,6 +896,9 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
                     {
                         struct mehcached_item *new_item = (struct mehcached_item *)mehcached_pool_item(&table->alloc[current_alloc_id], new_item_offset);
                         mehcached_memcpy8((uint8_t *)new_item, (const uint8_t *)item, item_size);
+
+			if (item->extptr)
+				new_item->extptr = item->extptr;
 
                         uint64_t new_item_vec = MEHCACHED_ITEM_VEC(MEHCACHED_TAG(item_vec), current_alloc_id, new_item_offset);
 
@@ -866,14 +945,14 @@ mehcached_get(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table 
 #ifndef NDEBUG
     // debug code to check how the code works when it read garbage values
     if (*in_out_value_length > 1500)
-        assert(false);
+        assert(0);
 #endif
 
-    return true;
+    return 1;
 }
 
-static
-bool
+
+int
 mehcached_test(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length)
 {
     assert(key_length <= MEHCACHED_MAX_KEY_LENGTH);
@@ -883,9 +962,9 @@ mehcached_test(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table
 
     struct mehcached_bucket *bucket = table->buckets + bucket_index;
 
-    while (true)
+    while (1)
     {
-        uint32_t version_start = mehcached_read_version_begin(table, bucket);
+        uint16_t version_start = mehcached_read_version_begin(table, bucket);
 
         struct mehcached_bucket *located_bucket;
         size_t item_index = mehcached_find_item_index(table, bucket, key_hash, tag, key, key_length, &located_bucket);
@@ -896,22 +975,22 @@ mehcached_test(uint8_t current_alloc_id MEHCACHED_UNUSED, struct mehcached_table
         if (item_index != MEHCACHED_ITEMS_PER_BUCKET)
         {
             MEHCACHED_STAT_INC(table, test_found);
-            return true;
+            return 1;
         }
         else
         {
             MEHCACHED_STAT_INC(table, test_notfound);
-            return false;
+            return 0;
         }
     }
 
     // not reachable
-    return false;
+    return 0;
 }
 
-static
-bool
-mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, bool overwrite)
+
+int
+mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, int overwrite, uintptr_t nicptr)
 {
     assert(key_length <= MEHCACHED_MAX_KEY_LENGTH);
     assert(value_length <= MEHCACHED_MAX_VALUE_LENGTH);
@@ -921,7 +1000,7 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
 
     struct mehcached_bucket *bucket = table->buckets + bucket_index;
 
-    bool overwriting;
+    int overwriting;
 
     mehcached_lock_bucket(table, bucket);
 
@@ -935,11 +1014,11 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
             MEHCACHED_STAT_INC(table, set_nooverwrite);
 
             mehcached_unlock_bucket(table, bucket);
-            return false;   // already exist but cannot overwrite
+            return 0;   // already exist but cannot overwrite
         }
         else
         {
-            overwriting = true;
+            overwriting = 1;
         }
     }
     else
@@ -962,11 +1041,12 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
             // no more space
             // TODO: add a statistics entry
             mehcached_unlock_bucket(table, bucket);
-            return false;
+	    printf("no more space no evict!\n");
+            return 0;
         }
 #endif
 
-        overwriting = false;
+        overwriting = 0;
     }
 
     uint32_t new_item_size = (uint32_t)(sizeof(struct mehcached_item) + MEHCACHED_ROUNDUP8(key_length) + MEHCACHED_ROUNDUP8(value_length));
@@ -1000,6 +1080,7 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
             if (mehcached_pool_is_valid(&table->alloc[current_alloc_id], item_offset))
 #endif
             {
+                // if (item->alloc_item.item_size >= new_item_size && item->alloc_item.refcount <= 1)
                 if (item->alloc_item.item_size >= new_item_size)
                 {
                     MEHCACHED_STAT_INC(table, set_inplace);
@@ -1010,8 +1091,12 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
                     mehcached_pool_unlock(&table->alloc[current_alloc_id]);
 #endif
                     mehcached_unlock_bucket(table, bucket);
-                    return true;
-                }
+                    return 1;
+                } else {
+			// printf("item in use releasing and moving to a different place!\n");
+			// __sync_fetch_and_sub((volatile uint32_t *)&item->alloc_item.refcount, (volatile uint32_t)1);
+			item->alloc_item.refcount--;
+		}
             }
         }
     }
@@ -1020,6 +1105,19 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
     uint64_t new_item_offset = mehcached_pool_allocate(&table->alloc[current_alloc_id], new_item_size);
     uint64_t new_tail = table->alloc[current_alloc_id].tail;
     struct mehcached_item *new_item = (struct mehcached_item *)mehcached_pool_item(&table->alloc[current_alloc_id], new_item_offset);
+    struct mehcached_alloc_item *extptr = NULL;
+
+    if (nicptr != -1) {
+	    uint32_t new_extptr_size;
+	    if (nicptr == SPLIT_MARKER)
+		    new_extptr_size = (uint32_t)(sizeof(struct mehcached_alloc_item) + MEHCACHED_ROUNDUP8(value_length));
+	    else
+		    new_extptr_size = (uint32_t)(sizeof(struct mehcached_alloc_item) + sizeof(void*));
+
+	    uint64_t new_extptr_offset = mehcached_pool_allocate(&table->alloc2[current_alloc_id], new_extptr_size);
+	    extptr = (struct mehcached_alloc_item *)mehcached_pool_item(&table->alloc2[current_alloc_id], new_extptr_offset);
+    }
+
 #endif
 #ifdef MEHCACHED_ALLOC_MALLOC
     uint64_t new_item_offset = mehcached_malloc_allocate(&table->alloc, new_item_size);
@@ -1028,7 +1126,8 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
         // no more space
         // TODO: add a statistics entry
         mehcached_unlock_bucket(table, bucket);
-        return false;
+	printf("no more space2!\n");
+        return 0;
     }
     struct mehcached_item *new_item = (struct mehcached_item *)mehcached_malloc_item(&table->alloc, new_item_offset);
 #endif
@@ -1041,14 +1140,15 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
         // no more space
         // TODO: add a statistics entry
         mehcached_unlock_bucket(table, bucket);
-        return false;
+	printf("no more space2!\n");
+        return 0;
     }
     struct mehcached_item *new_item = (struct mehcached_item *)mehcached_dynamic_item(&table->alloc, new_item_offset);
 #endif
 
     MEHCACHED_STAT_INC(table, set_new);
 
-    mehcached_set_item(new_item, key_hash, key, (uint32_t)key_length, value, (uint32_t)value_length, expire_time);
+    mehcached_set_item(new_item, key_hash, key, (uint32_t)key_length, value, (uint32_t)value_length, expire_time, extptr, nicptr);
 #ifdef MEHCACHED_ALLOC_POOL
     // unlocking is delayed until we finish writing data at the new location;
     // otherwise, the new location may be invalidated (in a very rare case)
@@ -1089,11 +1189,11 @@ mehcached_set(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t 
 
     MEHCACHED_STAT_INC(table, count);
 
-    return true;
+    return 1;
 }
 
-static
-bool
+
+int
 mehcached_delete(uint8_t alloc_id MEHCACHED_UNUSED, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length)
 {
     assert(key_length <= MEHCACHED_MAX_KEY_LENGTH);
@@ -1111,7 +1211,7 @@ mehcached_delete(uint8_t alloc_id MEHCACHED_UNUSED, struct mehcached_table *tabl
     {
         mehcached_unlock_bucket(table, bucket);
         MEHCACHED_STAT_INC(table, delete_notfound);
-        return false;
+        return 0;
     }
 
     located_bucket->item_vec[item_index] = 0;
@@ -1122,11 +1222,11 @@ mehcached_delete(uint8_t alloc_id MEHCACHED_UNUSED, struct mehcached_table *tabl
     mehcached_unlock_bucket(table, bucket);
 
     MEHCACHED_STAT_INC(table, delete_found);
-    return true;
+    return 1;
 }
 
-static
-bool
+
+int
 mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uint64_t key_hash, const uint8_t *key, size_t key_length, uint64_t increment, uint64_t *out_new_value, uint32_t expire_time)
 {
     assert(key_length <= MEHCACHED_MAX_KEY_LENGTH);
@@ -1147,13 +1247,13 @@ mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uin
     {
         mehcached_unlock_bucket(table, bucket);
         // TODO: support seeding a new item with the given default value?
-        return false;   // does not exist
+        return 0;   // does not exist
     }
 
     if (current_alloc_id != MEHCACHED_ALLOC_ID(located_bucket->item_vec[item_index]))
     {
         mehcached_unlock_bucket(table, bucket);
-        return false;   // writing to a different alloc is not allowed
+        return 0;   // writing to a different alloc is not allowed
     }
 
     uint64_t item_offset = MEHCACHED_ITEM_OFFSET(located_bucket->item_vec[item_index]);
@@ -1167,7 +1267,7 @@ mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uin
         mehcached_pool_unlock(&table->alloc[current_alloc_id]);
         mehcached_unlock_bucket(table, bucket);
         // TODO: support seeding a new item with the given default value?
-        return false;   // exists in the table but not valid in the pool
+        return 0;   // exists in the table but not valid in the pool
     }
 #endif
 
@@ -1188,7 +1288,7 @@ mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uin
         mehcached_pool_unlock(&table->alloc[current_alloc_id]);
 #endif
         mehcached_unlock_bucket(table, bucket);
-        return false;   // invalid value size
+        return 0;   // invalid value size
     }
 
     uint64_t old_value;
@@ -1205,13 +1305,13 @@ mehcached_increment(uint8_t current_alloc_id, struct mehcached_table *table, uin
 #endif
     mehcached_unlock_bucket(table, bucket);
 
-    return true;
+    return 1;
 }
 
 /*
-static
+
 void
-mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table, struct mehcached_request *requests, size_t num_requests, const uint8_t *in_data, uint8_t *out_data, size_t *out_data_length, bool readonly)
+mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table, struct mehcached_request *requests, size_t num_requests, const uint8_t *in_data, uint8_t *out_data, size_t *out_data_length, int readonly)
 {
     assert(sizeof(struct mehcached_request) == 24);
 
@@ -1221,7 +1321,7 @@ mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table,
     const uint8_t *out_data_end = out_data + *out_data_length;
 
 #ifdef MEHCACHED_DEDUP_WITHIN_BATCH
-    bool dup[num_requests];
+    int dup[num_requests];
     size_t key_lengths[num_requests];
     size_t value_lengths[num_requests];
     const uint8_t *keys[num_requests];
@@ -1255,7 +1355,7 @@ mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table,
                     if (req->key_hash == req_t->key_hash && mehcached_compare_keys(keys[request_index], key_lengths[request_index], keys[request_index_t], key_lengths[request_index_t]))
                     {
                         // this request can be skipped
-                        dup[request_index] = true;
+                        dup[request_index] = 1;
                         break;
                     }
                 }
@@ -1303,7 +1403,7 @@ mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table,
             case MEHCACHED_SET:
                 {
                     // TODO: dedup should handle a mixture or ADD and SET correctly
-                    bool overwrite = req->operation == MEHCACHED_SET;
+                    int overwrite = req->operation == MEHCACHED_SET;
 #ifdef MEHCACHED_DEDUP_WITHIN_BATCH
                     if (dup[request_index])
                         req->result = MEHCACHED_OK;
@@ -1389,7 +1489,7 @@ mehcached_process_batch(uint8_t current_alloc_id, struct mehcached_table *table,
 */
 
 
-static
+
 void
 mehcached_table_reset(struct mehcached_table *table)
 {
@@ -1437,6 +1537,7 @@ mehcached_table_reset(struct mehcached_table *table)
     {
         mehcached_pool_lock(&table->alloc[alloc_id]);
         mehcached_pool_reset(&table->alloc[alloc_id]);
+        mehcached_pool_reset(&table->alloc2[alloc_id]);
         mehcached_pool_unlock(&table->alloc[alloc_id]);
     }
 #endif
@@ -1453,9 +1554,9 @@ mehcached_table_reset(struct mehcached_table *table)
     mehcached_reset_table_stats(table);
 }
 
-static
+
 void
-mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t num_pools MEHCACHED_UNUSED, size_t pool_size MEHCACHED_UNUSED, bool concurrent_table_read, bool concurrent_table_write, bool concurrent_alloc_write, size_t table_numa_node, size_t alloc_numa_nodes[], double mth_threshold)
+mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t num_pools MEHCACHED_UNUSED, size_t pool_size MEHCACHED_UNUSED, int concurrent_table_read, int concurrent_table_write, int concurrent_alloc_write, size_t table_numa_node, size_t alloc_numa_nodes[], double mth_threshold)
 {
     assert((MEHCACHED_ITEMS_PER_BUCKET == 7 && sizeof(struct mehcached_bucket) == 64) || (MEHCACHED_ITEMS_PER_BUCKET == 15 && sizeof(struct mehcached_bucket) == 128) || (MEHCACHED_ITEMS_PER_BUCKET == 31 && sizeof(struct mehcached_bucket) == 256));
     assert(sizeof(struct mehcached_item) == 24);
@@ -1467,7 +1568,7 @@ mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t n
     if (num_pools != 1)
     {
         fprintf(stderr, "the program is compiled with no support for multiple pools\n");
-        assert(false);
+        assert(0);
     }
 #endif
 
@@ -1493,25 +1594,25 @@ mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t n
         if (shm_id == (size_t)-1)
         {
             printf("failed to allocate memory\n");
-            assert(false);
+            assert(0);
         }
-        while (true)
+        while (1)
         {
             table->buckets = mehcached_shm_find_free_address(shm_size);
             if (table->buckets == NULL)
-                assert(false);
+                assert(0);
             if (mehcached_shm_map(shm_id, table->buckets, 0, shm_size))
                 break;
         }
         if (!mehcached_shm_schedule_remove(shm_id))
-            assert(false);
+            assert(0);
     }
 // #endif
 // #ifdef MEHCACHED_ALLOC_MALLOC
 //     {
 //         int ret = posix_memalign((void **)&table->buckets, 4096, sizeof(struct mehcached_bucket) * (table->num_buckets + table->num_extra_buckets));
 //         if (ret != 0)
-//             assert(false);
+//             assert(0);
 //     }
 // #endif
     table->extra_buckets = table->buckets + table->num_buckets - 1; // subtract by one to compensate 1-base indices
@@ -1531,8 +1632,12 @@ mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t n
     num_pools = mehcached_next_power_of_two(num_pools);
     table->alloc_id_mask = (uint8_t)(num_pools - 1);
     size_t alloc_id;
-    for (alloc_id = 0; alloc_id < num_pools; alloc_id++)
+    for (alloc_id = 0; alloc_id < num_pools; alloc_id++) {
         mehcached_pool_init(&table->alloc[alloc_id], pool_size, concurrent_table_read, concurrent_alloc_write, alloc_numa_nodes[alloc_id]);
+        mehcached_pool_init(&table->alloc2[alloc_id], pool_size, concurrent_table_read, concurrent_alloc_write, alloc_numa_nodes[alloc_id]);
+    }
+
+    printf("allocating pools %d of size %d table->alloc\n", num_pools, pool_size, table->alloc[0]);
     table->mth_threshold = (uint64_t)((double)table->alloc[0].size * mth_threshold);
 
     table->rshift = 0;
@@ -1593,7 +1698,7 @@ mehcached_table_init(struct mehcached_table *table, size_t num_buckets, size_t n
     printf("\n");
 }
 
-static
+
 void
 mehcached_table_free(struct mehcached_table *table)
 {
@@ -1603,7 +1708,7 @@ mehcached_table_free(struct mehcached_table *table)
 
 // #ifdef MEHCACHED_ALLOC_POOL
     if (!mehcached_shm_unmap(table->buckets))
-        assert(false);
+        assert(0);
 // #endif
 // #ifdef MEHCACHED_ALLOC_MALLOC
 //     free(table->buckets);
@@ -1611,8 +1716,10 @@ mehcached_table_free(struct mehcached_table *table)
 
 #ifdef MEHCACHED_ALLOC_POOL
     size_t alloc_id;
-    for (alloc_id = 0; alloc_id < (size_t)(table->alloc_id_mask + 1); alloc_id++)
+    for (alloc_id = 0; alloc_id < (size_t)(table->alloc_id_mask + 1); alloc_id++) {
         mehcached_pool_free(&table->alloc[alloc_id]);
+        mehcached_pool_free(&table->alloc2[alloc_id]);
+    }
 #endif
 #ifdef MEHCACHED_ALLOC_MALLOC
     mehcached_malloc_free(&table->alloc);

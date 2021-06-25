@@ -14,15 +14,17 @@
 
 #pragma once
 
+#include "util.h"
 #include "alloc_pool.h"
 #include "table.h"
 #include "shm.h"
+#include <signal.h>
 
 MEHCACHED_BEGIN
 
-static
+
 void
-mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, bool concurrent_alloc_read, bool concurrent_alloc_write, size_t numa_node)
+mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, int concurrent_alloc_read, int concurrent_alloc_write, size_t numa_node)
 {
     if (size < MEHCACHED_MINIMUM_POOL_SIZE)
         size = MEHCACHED_MINIMUM_POOL_SIZE;
@@ -48,13 +50,13 @@ mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, bool concurrent
     if (shm_id == (size_t)-1)
 	{
 		printf("failed to allocate memory\n");
-        assert(false);
+        assert(0);
 	}
-    while (true)
+    while (1)
     {
 		alloc->data = mehcached_shm_find_free_address(size + MEHCACHED_MINIMUM_POOL_SIZE);
 		if (alloc->data == NULL)
-			assert(false);
+			assert(0);
 
         if (!mehcached_shm_map(shm_id, alloc->data, 0, size))
 			continue;
@@ -72,28 +74,28 @@ mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, bool concurrent
     if (!mehcached_shm_schedule_remove(shm_id))
     {
         perror("");
-        assert(false);
+        assert(0);
     }
 }
 
-static
+
 void
 mehcached_pool_free(struct mehcached_pool *alloc)
 {
 	if (!mehcached_shm_unmap(alloc->data))
-		assert(false);
+		assert(0);
 	if (!mehcached_shm_unmap(alloc->data + alloc->size))
-		assert(false);
+		assert(0);
 }
 
-static
+
 void
 mehcached_pool_reset(struct mehcached_pool *alloc)
 {
     alloc->head = alloc->tail = 0;
 }
 
-static
+
 void
 mehcached_pool_lock(struct mehcached_pool *alloc MEHCACHED_UNUSED)
 {
@@ -109,7 +111,7 @@ mehcached_pool_lock(struct mehcached_pool *alloc MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 void
 mehcached_pool_unlock(struct mehcached_pool *alloc MEHCACHED_UNUSED)
 {
@@ -124,21 +126,21 @@ mehcached_pool_unlock(struct mehcached_pool *alloc MEHCACHED_UNUSED)
 #endif
 }
 
-static
+
 struct mehcached_alloc_item *
 mehcached_pool_item(const struct mehcached_pool *alloc, uint64_t pool_offset)
 {
     return (struct mehcached_alloc_item *)(alloc->data + (pool_offset & alloc->mask));
 }
 
-static
+
 void
 mehcached_pool_check_invariants(const struct mehcached_pool *alloc MEHCACHED_UNUSED)
 {
     assert(alloc->tail - alloc->head <= alloc->size);
 }
 
-static
+
 void
 mehcached_pool_pop_head(struct mehcached_pool *alloc)
 {
@@ -146,12 +148,16 @@ mehcached_pool_pop_head(struct mehcached_pool *alloc)
 #ifdef MEHCACHED_VERBOSE
     printf("popping item size = %u at head = %lu\n", alloc_item->item_size, alloc->head & MEHCACHED_ITEM_OFFSET_MASK);
 #endif
+    // printf("popping item alloc = %p size = %u at head = %lu\n", alloc, alloc_item->item_size, alloc->head);
 
     alloc->head += alloc_item->item_size;
+    //__sync_fetch_and_add((volatile uint64_t *)&alloc->head, alloc_item->item_size);
+    if (unlikely(alloc_item->item_size == 0))
+	    raise(SIGTRAP);
     mehcached_pool_check_invariants(alloc);
 }
 
-static
+
 uint64_t
 mehcached_pool_push_tail(struct mehcached_pool *alloc, uint32_t item_size)
 {
@@ -167,10 +173,10 @@ mehcached_pool_push_tail(struct mehcached_pool *alloc, uint32_t item_size)
     struct mehcached_alloc_item *alloc_item = mehcached_pool_item(alloc, item_offset);
     alloc_item->item_size = item_size;
 
-    if (alloc->concurrent_access_mode == 0)
-        alloc->tail += item_size;
-    else
-    {
+    if (alloc->concurrent_access_mode == 0) {
+	alloc->tail += item_size;
+        //__sync_fetch_and_add((volatile uint64_t *)&alloc->tail, item_size);
+    } else {
         *(volatile uint64_t *)&alloc->tail += item_size;
         memory_barrier();
     }
@@ -184,15 +190,15 @@ mehcached_pool_push_tail(struct mehcached_pool *alloc, uint32_t item_size)
     return item_offset & MEHCACHED_ITEM_OFFSET_MASK;
 }
 
-static
+
 uint64_t
 mehcached_pool_allocate(struct mehcached_pool *alloc, uint32_t item_size)
 {
     return mehcached_pool_push_tail(alloc, item_size);
 }
 
-static
-bool
+
+int
 mehcached_pool_is_valid(const struct mehcached_pool *alloc, uint64_t pool_offset)
 {
     if (alloc->concurrent_access_mode == 0)

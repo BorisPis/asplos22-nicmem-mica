@@ -45,7 +45,7 @@ test_load()
         size_t key = i;
         size_t value = i;
         uint64_t key_hash = hash((const uint8_t *)&key, sizeof(key));
-        mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, false);
+        mehcached_set(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (const uint8_t *)&value, sizeof(value), 0, false, -1);
     }
 
     for (i = 0; i < num_items; i++)
@@ -55,7 +55,8 @@ test_load()
         size_t value_len = sizeof(value);
         uint64_t key_hash = hash((const uint8_t *)&key, sizeof(key));
 
-        if (mehcached_get(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (uint8_t *)&value, &value_len, NULL, false))
+	int copy = true;
+        if (mehcached_get(0, table, key_hash, (const uint8_t *)&key, sizeof(key), (uint8_t *)&value, &value_len, NULL, false, &copy, NULL, NULL))
             success_count++;
         else
         {
