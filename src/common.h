@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __COMMON_H__
+#define __COMMON_H__
+
 #pragma once
 
 #include "basic_types.h"
@@ -32,3 +35,4 @@
 
 #include "config.h"
 
+#endif

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __SHM_H__
+#define __SHM_H__
+
 #pragma once
 
 #include "common.h"
@@ -33,13 +36,13 @@ mehcached_shm_find_free_address(size_t size);
 size_t
 mehcached_shm_alloc(size_t length, size_t numa_node);
 
-bool
+int
 mehcached_shm_schedule_remove(size_t entry_id);
 
-bool
+int
 mehcached_shm_map(size_t entry_id, void *ptr, size_t offset, size_t length);
 
-bool
+int
 mehcached_shm_unmap(void *ptr);
 
 size_t
@@ -65,3 +68,4 @@ mehcached_shm_free_striped(void *ptr);
 
 MEHCACHED_END
 
+#endif

@@ -27,6 +27,8 @@
 #include "netbench_config.h"
 #include "netbench_hot_item_hash.h"
 #include "table.h"
+#include "util.h"
+#include "alloc_pool.h"
 
 #include <rte_launch.h>
 #include <rte_eal.h>
@@ -34,7 +36,6 @@
 #include <rte_lcore.h>
 #include <rte_byteorder.h>
 #include <rte_log.h>
-#include <rte_malloc.h>
 #include <rte_debug.h>
 
 #if !defined(NETBENCH_SERVER_MEMCACHED) && !defined(NETBENCH_SERVER_MASSTREE) && !defined(NETBENCH_SERVER_RAMCLOUD)
@@ -52,7 +53,7 @@
 #endif
 
 
-//#define USE_HOT_ITEMS
+// #define USE_HOT_ITEMS
 
 struct server_state
 {
@@ -165,9 +166,9 @@ mehcached_remote_send_response(struct server_state *state, struct rte_mbuf *mbuf
         next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
     }
 
-    struct ether_hdr *eth = (struct ether_hdr *)rte_pktmbuf_mtod(mbuf, unsigned char *);
-    struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-    struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)rte_pktmbuf_mtod(mbuf, unsigned char *);
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+    struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
     uint16_t packet_length = (uint16_t)(next_key - (uint8_t *)packet);
 
@@ -181,7 +182,7 @@ mehcached_remote_send_response(struct server_state *state, struct rte_mbuf *mbuf
 
     // swap source and destination
     {
-        struct ether_addr t = eth->s_addr;
+        struct rte_ether_addr t = eth->s_addr;
         eth->s_addr = eth->d_addr;
         eth->d_addr = t;
     }
@@ -199,20 +200,20 @@ mehcached_remote_send_response(struct server_state *state, struct rte_mbuf *mbuf
     // reset TTL
     ip->time_to_live = 64;
 
-    ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr)));
-    udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr)));
+    ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr)));
+    udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr)));
 
-    mbuf->pkt.data_len = packet_length;
-    mbuf->pkt.pkt_len = (uint32_t)packet_length;
-    mbuf->pkt.next = NULL;
-    mbuf->pkt.nb_segs = 1;
+    rte_pktmbuf_data_len(mbuf) = packet_length;
+    rte_pktmbuf_pkt_len(mbuf) = (uint32_t)packet_length;
+    mbuf->next = NULL;
+    mbuf->nb_segs = 1;
     mbuf->ol_flags = 0;
 
 #ifndef NDEBUG
-    rte_mbuf_sanity_check(mbuf, RTE_MBUF_PKT, 1);
-    if (rte_pktmbuf_headroom(mbuf) + mbuf->pkt.data_len > mbuf->buf_len)
+    rte_mbuf_sanity_check(mbuf, 1);
+    if (rte_pktmbuf_headroom(mbuf) + rte_pktmbuf_data_len(mbuf) > mbuf->buf_len)
     {
-        printf("data_len = %hd\n", mbuf->pkt.data_len);
+        printf("data_len = %hd\n", rte_pktmbuf_data_len(mbuf));
         uint8_t request_index;
         const uint8_t *next_key = packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests;
         for (request_index = 0; request_index < packet->num_requests; request_index++)
@@ -223,7 +224,7 @@ mehcached_remote_send_response(struct server_state *state, struct rte_mbuf *mbuf
             next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
         }
     }
-    assert(rte_pktmbuf_headroom(mbuf) + mbuf->pkt.data_len <= mbuf->buf_len);
+    //assert(rte_pktmbuf_headroom(mbuf) + rte_pktmbuf_data_len(mbuf) <= mbuf->buf_len);
 #endif
 
     mehcached_send_packet(port_id, mbuf);
@@ -383,7 +384,7 @@ mehcached_benchmark_server_proc(void *arg)
         //     if (mbuf == NULL)
         //         break;
 
-        //     state->bytes_rx += (uint64_t)(mbuf->pkt.data_len + 24);   // 24 for PHY overheads
+        //     state->bytes_rx += (uint64_t)(rte_pktmbuf_data_len(mbuf) + 24);   // 24 for PHY overheads
 
         //     packet_mbufs[packet_count] = mbuf;
         //     packet_count++;
@@ -456,7 +457,7 @@ mehcached_benchmark_server_proc(void *arg)
         {
             size_t packet_index;
             for (packet_index = 0; packet_index < packet_count; packet_index++)
-                state->bytes_rx += (uint64_t)(packet_mbufs[packet_index]->pkt.data_len + 24);   // 24 for PHY overheads
+                state->bytes_rx += (uint64_t)(rte_pktmbuf_data_len(packet_mbufs[packet_index]) + 24);   // 24 for PHY overheads
         }
 
 
@@ -561,8 +562,8 @@ mehcached_benchmark_server_proc(void *arg)
 #endif
 #endif
 
-                uint8_t new_key_values[ETHER_MAX_LEN - ETHER_CRC_LEN - sizeof(struct mehcached_batch_packet)];
-                size_t new_key_value_length = ETHER_MAX_LEN - ETHER_CRC_LEN - sizeof(struct mehcached_batch_packet) - sizeof(struct mehcached_request) * (size_t)packet->num_requests;
+                uint8_t new_key_values[RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN - sizeof(struct mehcached_batch_packet)];
+                size_t new_key_value_length = RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN - sizeof(struct mehcached_batch_packet) - sizeof(struct mehcached_request) * (size_t)packet->num_requests;
 
 #ifdef MEHCACHED_MEASURE_LATENCY
                 uint32_t org_expire_time;
@@ -981,29 +982,10 @@ mehcached_benchmark_server_proc(void *arg)
                         struct rte_eth_stats stats;
                         rte_eth_stats_get(port_id, &stats);
 
-#ifndef MEHCACHED_USE_SOFT_FDIR
                         uint64_t new_ipackets = stats.ipackets - last_ipackets[port_id];
                         last_ipackets[port_id] = stats.ipackets;
                         uint64_t new_ierrors = stats.ierrors - last_ierrors[port_id];
                         last_ierrors[port_id] = stats.ierrors;
-#else
-                        uint64_t ipackets = stats.ipackets;
-                        uint64_t ierrors = stats.ierrors;
-                        // treat dropped packets by soft fdir as dropped packets by NIC RX
-                        {
-                            uint8_t thread_id;
-                            for (thread_id = 0; thread_id < server_conf->num_threads; thread_id++)
-                            {
-                                uint64_t num_soft_fdir_dropped = states[thread_id]->num_soft_fdir_dropped[port_id];
-                                ipackets -= num_soft_fdir_dropped;
-                                ierrors += num_soft_fdir_dropped;
-                            }
-                        }
-                        uint64_t new_ipackets = ipackets - last_ipackets[port_id];
-                        last_ipackets[port_id] = ipackets;
-                        uint64_t new_ierrors = ierrors - last_ierrors[port_id];
-                        last_ierrors[port_id] = ierrors;
-#endif
                         // uint64_t new_opackets = stats.opackets - last_opackets[port_id];
                         // last_opackets[port_id] = stats.opackets;
                         // uint64_t new_oerrors = stats.oerrors - last_oerrors[port_id];
@@ -1029,8 +1011,6 @@ mehcached_benchmark_server_proc(void *arg)
                         //     max_loss = oloss;
 
 #ifndef NDEBUG
-                        if (stats.fdirmiss != 0)
-                            printf("non-zero fdirmiss on port %hhu\n", port_id);
                         if (stats.rx_nombuf != 0)
                             printf("non-zero rx_nombuf on port %hhu\n", port_id);
 #endif
@@ -1134,7 +1114,7 @@ mehcached_diagnosis(struct mehcached_server_conf *server_conf)
             {
                 struct mehcached_diagnosis_arg diagnosis_arg;
                 diagnosis_arg.port_id = port_id;
-                rte_eal_launch(mehcached_diagnosis_receive_packet_proc, &diagnosis_arg, (unsigned int)thread_id);
+                rte_eal_remote_launch(mehcached_diagnosis_receive_packet_proc, &diagnosis_arg, (unsigned int)thread_id);
                 rte_eal_mp_wait_lcore();
 
                 struct rte_mbuf *mbuf = diagnosis_arg.ret_mbuf;
@@ -1143,9 +1123,9 @@ mehcached_diagnosis(struct mehcached_server_conf *server_conf)
 
                 struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, struct mehcached_batch_packet *);
 
-                struct ether_hdr *eth = (struct ether_hdr *)rte_pktmbuf_mtod(mbuf, unsigned char *);
-                struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-                struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+                struct rte_ether_hdr *eth = (struct rte_ether_hdr *)rte_pktmbuf_mtod(mbuf, unsigned char *);
+                struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+                struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
                 uint16_t mapping_id = rte_be_to_cpu_16(udp->dst_port);
 
@@ -1181,14 +1161,14 @@ mehcached_diagnosis(struct mehcached_server_conf *server_conf)
                     // TODO: implement
                 }
 
-                if (error_count < 16)   // report up to 16 errors per period
-                {
-                    if (!correct_port)
-                        printf("wrong port: mapping = %hu, port = %hhu; fdir.hash = %hu, fdir.id = %hu\n", mapping_id, port_id, mbuf->pkt.hash.fdir.hash, mbuf->pkt.hash.fdir.id);
+                // if (error_count < 16)   // report up to 16 errors per period
+                // {
+                //     if (!correct_port)
+                //         printf("wrong port: mapping = %hu, port = %hhu; fdir.hash = %hu, fdir.id = %hu\n", mapping_id, port_id, mbuf->pkt.hash.fdir.hash, mbuf->pkt.hash.fdir.id);
 
-                    if (!correct_queue)
-                        printf("wrong queue: mapping = %hu, port = %hhu, queue = %hhu; fdir.hash = %hu, fdir.id = %hu\n", mapping_id, port_id, thread_id, mbuf->pkt.hash.fdir.hash, mbuf->pkt.hash.fdir.id);
-                }
+                //     if (!correct_queue)
+                //         printf("wrong queue: mapping = %hu, port = %hhu, queue = %hhu; fdir.hash = %hu, fdir.id = %hu\n", mapping_id, port_id, thread_id, mbuf->pkt.hash.fdir.hash, mbuf->pkt.hash.fdir.id);
+                // }
 
                 if (correct_port && correct_queue)
                     noerror_count++;
@@ -1351,7 +1331,7 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     printf("initializing shm\n");
 
     const size_t page_size = 1048576 * 2;
-    const size_t num_numa_nodes = 2;
+    const size_t num_numa_nodes = 1;
     const size_t num_pages_to_try = 16384;
     const size_t num_pages_to_reserve = 16384 - 2048;	// give 2048 pages to dpdk
 
@@ -1360,23 +1340,25 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     printf("initializing DPDK\n");
 
     uint64_t cpu_mask = ((uint64_t)1 << server_conf->num_threads) - 1;
-    char cpu_mask_str[10];
+    cpu_mask &= 0x55555555l;
+    char cpu_mask_str[20];
     snprintf(cpu_mask_str, sizeof(cpu_mask_str), "%lx", cpu_mask);
 
     char memory_str[10];
     snprintf(memory_str, sizeof(memory_str), "%zu", (num_pages_to_try - num_pages_to_reserve) * 2);   // * 2 is because the used huge page size is 2 MB
 
+    printf("CPU mask %llx mem %s\n", cpu_mask, memory_str);
     char *rte_argv[] = {"",
         "-c", cpu_mask_str,
-        "-n", "4",    // 4 for server 
+        "-n", "8",    // 4 for server 
         "-m", memory_str,
-        "-b", "0000:06:00.0",
-        "-b", "0000:06:00.1",
+        "-b", "0000:5e:00.0",
+        // "-b", "0000:06:00.1",
     };
     int rte_argc = sizeof(rte_argv) / sizeof(rte_argv[0]);
 
-    //rte_set_log_level(RTE_LOG_DEBUG);
-    rte_set_log_level(RTE_LOG_NOTICE);
+    rte_log_set_global_level(RTE_LOG_DEBUG);
+    //rte_log_set_global_level(RTE_LOG_NOTICE);
 
     int ret = rte_eal_init(rte_argc, rte_argv);
     if (ret < 0)
@@ -1399,8 +1381,8 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     uint8_t port_id;
     for (port_id = 0; port_id < server_conf->num_ports; port_id++)
     {
-        struct ether_addr mac_addr;
-        memcpy(&mac_addr, server_conf->ports[port_id].mac_addr, sizeof(struct ether_addr));
+        struct rte_ether_addr mac_addr;
+        memcpy(&mac_addr, server_conf->ports[port_id].mac_addr, sizeof(struct rte_ether_addr));
         if (rte_eth_dev_mac_addr_add(port_id, &mac_addr, 0) != 0)
         {
             fprintf(stderr, "failed to add a MAC address\n");
@@ -1452,9 +1434,7 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
 
 
     printf("cleaning up pending packets\n");
-    for (thread_id = 1; thread_id < server_conf->num_threads; thread_id++)
-        rte_eal_launch(mehcached_benchmark_consume_packets_proc, (void *)(size_t)server_conf->num_ports, (unsigned int)thread_id);
-    rte_eal_launch(mehcached_benchmark_consume_packets_proc, (void *)(size_t)server_conf->num_ports, 0);
+    rte_eal_mp_remote_launch(mehcached_benchmark_consume_packets_proc, (void *)(size_t)server_conf->num_ports, CALL_MASTER);
 
     rte_eal_mp_wait_lcore();
 
@@ -1652,11 +1632,9 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     // for (thread_id = 1; thread_id < server_conf->num_threads; thread_id++)
     //     rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, (unsigned int)thread_id);
     // rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 0);
+    // TODO BP Why only one core?
     assert(rte_lcore_to_socket_id(0) == 0);
-    assert(rte_lcore_to_socket_id(1) == 1);
-    rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 0);
-    rte_eal_mp_wait_lcore();
-    rte_eal_launch(mehcached_benchmark_prepopulate_proc, states, 1);
+    rte_eal_remote_launch(mehcached_benchmark_prepopulate_proc, states, 0);
     rte_eal_mp_wait_lcore();
 
     size_t mem_diff = mehcached_get_memuse() - mem_start;
@@ -1674,9 +1652,7 @@ mehcached_benchmark_server(const char *machine_filename, const char *server_name
     // use this for diagnosis (the actual server will not be run)
     // mehcached_diagnosis(server_conf);
 
-    for (thread_id = 1; thread_id < server_conf->num_threads; thread_id++)
-        rte_eal_launch(mehcached_benchmark_server_proc, states, (unsigned int)thread_id);
-    rte_eal_launch(mehcached_benchmark_server_proc, states, 0);
+    rte_eal_mp_remote_launch(mehcached_benchmark_server_proc, states, CALL_MASTER);
 
     rte_eal_mp_wait_lcore();
 

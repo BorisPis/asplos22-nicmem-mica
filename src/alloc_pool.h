@@ -39,48 +39,48 @@ struct mehcached_pool
     uint64_t tail;  // end offset of items
 } MEHCACHED_ALIGNED(64);
 
-static
-void
-mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, bool concurrent_alloc_read, bool concurrent_alloc_write, size_t numa_node);
 
-static
+void
+mehcached_pool_init(struct mehcached_pool *alloc, uint64_t size, int concurrent_alloc_read, int concurrent_alloc_write, size_t numa_node);
+
+
 void
 mehcached_pool_free(struct mehcached_pool *alloc);
 
-static
+
 void
 mehcached_pool_reset(struct mehcached_pool *alloc);
 
-static
+
 void
 mehcached_pool_lock(struct mehcached_pool *alloc);
 
-static
+
 void
 mehcached_pool_unlock(struct mehcached_pool *alloc);
 
-static
+
 struct mehcached_alloc_item *
 mehcached_pool_item(const struct mehcached_pool *alloc, uint64_t pool_offset);
 
-static
+
 void
 mehcached_pool_check_invariants(const struct mehcached_pool *alloc);
 
-static
+
 void
 mehcached_pool_pop_head(struct mehcached_pool *alloc);
 
-static
+
 uint64_t
 mehcached_pool_push_tail(struct mehcached_pool *alloc, uint32_t item_size);
 
-static
+
 uint64_t
 mehcached_pool_allocate(struct mehcached_pool *alloc, uint32_t item_size);
 
-static
-bool
+
+int
 mehcached_pool_is_valid(const struct mehcached_pool *alloc, uint64_t pool_offset);
 
 MEHCACHED_END

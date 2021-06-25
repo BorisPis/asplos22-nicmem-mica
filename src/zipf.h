@@ -78,6 +78,10 @@ mehcached_zipf_init(struct zipf_gen_state *state, uint64_t n, double theta, uint
 		assert(false);
 	}
 	assert(theta == -1. || (theta >= 0. && theta < 1.) || theta >= 40.);
+	printf("rand: %llx < %llx\n", rand_seed, (1UL << 48));
+	while (rand_seed > (1UL << 48))
+		rand_seed >>= 1;
+	printf("rand: %llx < %llx\n", rand_seed, (1UL << 48));
 	assert(rand_seed < (1UL << 48));
 	memset(state, 0, sizeof(struct zipf_gen_state));
 	state->n = n;
@@ -106,6 +110,8 @@ static
 void
 mehcached_zipf_init_copy(struct zipf_gen_state *state, const struct zipf_gen_state *src_state, uint64_t rand_seed)
 {
+	while (rand_seed > (1UL << 48))
+		rand_seed >>= 1;
 	assert(rand_seed < (1UL << 48));
 	memcpy(state, src_state, sizeof(struct zipf_gen_state));
 	// state->rand_state[0] = (unsigned short)(rand_seed >> 0);

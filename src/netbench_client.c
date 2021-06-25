@@ -53,7 +53,7 @@ struct client_state
     struct mehcached_server_conf *server_conf;
 
 	struct mehcached_hot_item_hash hot_item_hash;
-	uint8_t header_template[sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr) + sizeof(struct udp_hdr)];
+	uint8_t header_template[sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr)];
 
 	// runtime state
 	struct packet_construction_state constr_state_e[MEHCACHED_MAX_PARTITIONS];
@@ -109,6 +109,12 @@ struct client_state
 } __rte_cache_aligned;
 
 static volatile bool exiting = false;
+static int mehcached_max_request_rate = 20000000;
+static uint16_t mehcached_lcore_to_thread_id[MEHCACHED_MAX_LCORES];
+static uint16_t mehcached_thread_id_to_lcore[MEHCACHED_MAX_LCORES];
+static double nic_ratio = 0;
+static uint32_t nic_num = 0;
+static bool force_nic_set = false;
 
 static
 void
@@ -132,7 +138,7 @@ mehcached_hash_key(uint64_t int_key)
 
 static
 uint16_t
-mehcached_calc_ip_checksum(struct ipv4_hdr *ip)
+mehcached_calc_ip_checksum(struct rte_ipv4_hdr *ip)
 {
 	uint16_t *ptr16;
     uint32_t ip_cksum;
@@ -156,7 +162,7 @@ mehcached_calc_ip_checksum(struct ipv4_hdr *ip)
 
 static
 void
-mehcached_update_ip_checksum(struct ipv4_hdr *ip, uint16_t old_v, uint16_t new_v)
+mehcached_update_ip_checksum(struct rte_ipv4_hdr *ip, uint16_t old_v, uint16_t new_v)
 {
 	// rfc1624
 	ip->hdr_checksum = (uint16_t)(~(~ip->hdr_checksum + ~old_v + new_v));
@@ -168,11 +174,11 @@ mehcached_init_header_template(struct client_state *state)
 {
 	memset(state->header_template, 0, sizeof(state->header_template));
 
-	struct ether_hdr *eth = (struct ether_hdr *)state->header_template;
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = (struct rte_ether_hdr *)state->header_template;
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
-	eth->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
+	eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
 	ip->version_ihl = 0x40 | 0x05;
 	ip->type_of_service = 0;
@@ -191,7 +197,8 @@ static
 void
 mehcached_remote_check_response(struct client_state *state)
 {
-	uint8_t thread_id = (uint8_t)rte_lcore_id();
+	uint8_t lcore = (uint8_t)rte_lcore_id();
+	uint8_t thread_id = mehcached_lcore_to_thread_id[lcore];
 	struct mehcached_workload_thread_conf *thread_conf = &state->workload_conf->threads[thread_id];
 	uint8_t port_id = thread_conf->port_ids[state->next_port_index_rx % thread_conf->num_ports];
 
@@ -206,66 +213,67 @@ mehcached_remote_check_response(struct client_state *state)
     {
 	    struct rte_mbuf *mbuf = mehcached_receive_packet(port_id);
 	    if (mbuf == NULL)
-	    	break;
+		    break;
 
-	    state->bytes_rx += (uint64_t)(mbuf->pkt.data_len + 24);	// 24 for PHY overheads
+	    state->bytes_rx += (uint64_t)(rte_pktmbuf_data_len(mbuf) + 24);	// 24 for PHY overheads
 
-		struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, struct mehcached_batch_packet *);
+	    struct mehcached_batch_packet *packet = rte_pktmbuf_mtod(mbuf, struct mehcached_batch_packet *);
 	    const uint8_t *next_key = packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests;
-		uint8_t request_index;
-		for (request_index = 0; request_index < packet->num_requests; request_index++)
-		{
-			struct mehcached_request *req = (struct mehcached_request *)packet->data + request_index;
+	    uint8_t request_index;
+	    for (request_index = 0; request_index < packet->num_requests; request_index++)
+	    {
+		    struct mehcached_request *req = (struct mehcached_request *)packet->data + request_index;
 
-			if (req->result == MEHCACHED_OK)
-			{
-// #ifndef MEHCACHED_MEASURE_LATENCY
-				state->num_operations_succeeded += RX_SAMPLE_RATE;
-// #else
-// 				if (thread_id == 0)
-// 					state->num_operations_succeeded += 1;
-// 				else
-// 					state->num_operations_succeeded += RX_SAMPLE_RATE;
-// #endif
-				if (req->operation == MEHCACHED_GET)
-				{
-					uint64_t v = *(uint64_t *)(next_key + MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)));
-					if ((v & 0xffffffff) != ((~v >> 32) & 0xffffffff))
-					{
-						static unsigned int p = 0;
-	                    if ((p++ & 63) == 0)
-							fprintf(stderr, "thread %hhu unexpected value returned: %lu %lu\n", thread_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
-					}
-				}
-			}
-	        next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
+		    if (req->result == MEHCACHED_OK)
+		    {
+			    // #ifndef MEHCACHED_MEASURE_LATENCY
+			    state->num_operations_succeeded += RX_SAMPLE_RATE;
+			    // #else
+			    // 				if (thread_id == 0)
+			    // 					state->num_operations_succeeded += 1;
+			    // 				else
+			    // 					state->num_operations_succeeded += RX_SAMPLE_RATE;
+			    // #endif
+#if 0
+			    if (req->operation == MEHCACHED_GET)
+			    {
+				    uint64_t v = *(uint64_t *)(next_key + MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)));
+				    if ((v & 0xffffffff) != ((~v >> 32) & 0xffffffff))
+				    {
+					    static unsigned int p = 0;
+					    if ((p++ & 63) == 0)
+						    fprintf(stderr, "thread %hhu unexpected value returned: %lu %lu\n", thread_id, (v & 0xffffffff), ((~v >> 32) & 0xffffffff));
+				    }
+			    }
+#endif
+		    }
+		    next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
 
 #ifdef MEHCACHED_MEASURE_LATENCY
-			if (request_index == 0 && state->record_latency)
-			{
-				uint32_t diff = t_now - req->expire_time;
-				uint64_t latency = mehcached_stopwatch_diff_in_us(diff, 0);
-
-				if (latency < 128)
-					state->latency_bin0[latency]++;
-				else if (latency < 384)
-					state->latency_bin1[(latency - 128) / 2]++;
-				else if (latency < 896)
-					state->latency_bin2[(latency - 384) / 4]++;
-				else if (latency < 1920)
-					state->latency_bin3[(latency - 896) / 8]++;
-				else
-					state->latency_bin4++;
-			}
+		    if (request_index == 0 && state->record_latency)
+		    {
+			    uint32_t diff = t_now - req->expire_time;
+			    uint64_t latency = mehcached_stopwatch_diff_in_us(diff, 0);
+			    if (latency < 128)
+				    state->latency_bin0[latency]++;
+			    else if (latency < 384)
+				    state->latency_bin1[(latency - 128) / 2]++;
+			    else if (latency < 896)
+				    state->latency_bin2[(latency - 384) / 4]++;
+			    else if (latency < 1920)
+				    state->latency_bin3[(latency - 896) / 8]++;
+			    else
+				    state->latency_bin4++;
+		    }
 #endif
-		}
+	    }
 
 #ifdef MEHCACHED_ENABLE_THROTTLING
-		state->target_request_rate_at_server = packet->opaque;
+	    state->target_request_rate_at_server = packet->opaque;
 #endif
 
-		mehcached_packet_free(mbuf);
-	}
+	    mehcached_packet_free(mbuf);
+    }
 }
 
 static
@@ -277,16 +285,17 @@ mehcached_need_to_init_packet(struct client_state *state MEHCACHED_UNUSED, struc
 
 static
 void
-mehcached_init_packet(struct client_state *state, struct packet_construction_state *constr_state, uint8_t batch_size, uint16_t mapping_id)
+mehcached_init_packet(struct client_state *state, struct packet_construction_state *constr_state, uint8_t batch_size, uint16_t mapping_id, uint32_t key_index)
 {
-	uint8_t thread_id = (uint8_t)rte_lcore_id();
+	uint8_t lcore = (uint8_t)rte_lcore_id();
+	uint8_t thread_id = mehcached_lcore_to_thread_id[lcore];
 
 	struct rte_mbuf *mbuf = mehcached_packet_alloc();
 	assert(mbuf != NULL);
 
-	struct ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
 	rte_memcpy(eth, state->header_template, sizeof(state->header_template));
 
@@ -297,11 +306,16 @@ mehcached_init_packet(struct client_state *state, struct packet_construction_sta
 
 	packet->num_requests = batch_size;
 	packet->reserved0 = 0;
-	packet->opaque = 0;
+	// packet->opaque = 0;
+	// printf("key index: %llx\n", key_index); // TODO: why I don't see the same index on the other side?
+	packet->opaque = key_index; // HACK: key_index
 
-	mbuf->pkt.next = NULL;
-	mbuf->pkt.nb_segs = 1;
+	mbuf->next = NULL;
+	mbuf->nb_segs = 1;
 	mbuf->ol_flags = 0;
+	mbuf->l2_len = sizeof(struct rte_ether_hdr);
+	mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
+	mbuf->l4_len = sizeof(struct rte_udp_hdr);
 
 	assert(constr_state->mbuf == NULL);
 	constr_state->mbuf = mbuf;
@@ -358,25 +372,25 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 	assert(constr_state->mbuf != NULL);
 	assert(mehcached_need_to_send_packet(state, constr_state));
 
-	struct ether_hdr *eth = rte_pktmbuf_mtod(constr_state->mbuf, struct ether_hdr *);
-	struct ipv4_hdr *ip = (struct ipv4_hdr *)((unsigned char *)eth + sizeof(struct ether_hdr));
-	struct udp_hdr *udp = (struct udp_hdr *)((unsigned char *)ip + sizeof(struct ipv4_hdr));
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(constr_state->mbuf, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((unsigned char *)eth + sizeof(struct rte_ether_hdr));
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((unsigned char *)ip + sizeof(struct rte_ipv4_hdr));
 
 	struct mehcached_batch_packet *packet = (struct mehcached_batch_packet *)eth;
 
-    // update stats
-    uint8_t request_index;
-    const uint8_t *next_key = packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests;
-    for (request_index = 0; request_index < packet->num_requests; request_index++)
-    {
-        struct mehcached_request *req = (struct mehcached_request *)packet->data + request_index;
+	// update stats
+	uint8_t request_index;
+	const uint8_t *next_key = packet->data + sizeof(struct mehcached_request) * (size_t)packet->num_requests;
+	for (request_index = 0; request_index < packet->num_requests; request_index++)
+	{
+		struct mehcached_request *req = (struct mehcached_request *)packet->data + request_index;
 
 		state->num_operations_done++;
 
 		if (*(const uint64_t *)next_key == 0)
 			state->num_key0_operations_done++;
 
-        next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
+		next_key += MEHCACHED_ROUNDUP8(MEHCACHED_KEY_LENGTH(req->kv_length_vec)) + MEHCACHED_ROUNDUP8(MEHCACHED_VALUE_LENGTH(req->kv_length_vec));
 	}
 
 	// XXX: hardcode to detect the destination server port
@@ -394,18 +408,22 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 
 	rte_memcpy(&eth->s_addr, state->client_conf->ports[port_id].mac_addr, 6);
 	rte_memcpy(&eth->d_addr, state->server_conf->ports[server_port_id].mac_addr, 6);
+	// printf("\n\nport: %d packet source %02X:%02X:%02X:%02X:%02X:%02X dst: %02X:%02X:%02X:%02X:%02X:%02X\n",
+	//        port_id,
+	//        eth->s_addr.addr_bytes[0], eth->s_addr.addr_bytes[1], eth->s_addr.addr_bytes[2], eth->s_addr.addr_bytes[3], eth->s_addr.addr_bytes[4], eth->s_addr.addr_bytes[5],
+	//        eth->d_addr.addr_bytes[0], eth->d_addr.addr_bytes[1], eth->d_addr.addr_bytes[2], eth->d_addr.addr_bytes[3], eth->d_addr.addr_bytes[4], eth->d_addr.addr_bytes[5]);
 
-// #ifdef MEHCACHED_MEASURE_LATENCY
-// 	if (rte_lcore_id() == 0)
-// 	{
-// 		// check response always on core 0
-// 		mehcached_remote_check_response(state);
-// 		// increment next_port_index_rx so that a tight loop calling mehcached_remote_check_response() can check all ports
-// 		state->next_port_index_rx++;
-// 	}
-// 	else
-// 	{
-// #endif
+	// #ifdef MEHCACHED_MEASURE_LATENCY
+	// 	if (rte_lcore_id() == 0)
+	// 	{
+	// 		// check response always on core 0
+	// 		mehcached_remote_check_response(state);
+	// 		// increment next_port_index_rx so that a tight loop calling mehcached_remote_check_response() can check all ports
+	// 		state->next_port_index_rx++;
+	// 	}
+	// 	else
+	// 	{
+	// #endif
 	if ((state->num_packets_initialized & (RX_SAMPLE_RATE - 1)) == 0)
 	{
 		// change rx_sample_v every RX_SAMPLE_RATE TX packets so that we can sample random RX packets within the batch
@@ -420,15 +438,15 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 		// use bogus source MAC address to avoid retrieval of this packet
 		eth->s_addr.addr_bytes[3] = 0xff;
 	}
-// #ifdef MEHCACHED_MEASURE_LATENCY
-// 	}
-// #endif
+	// #ifdef MEHCACHED_MEASURE_LATENCY
+	// 	}
+	// #endif
 
 	rte_memcpy(&ip->src_addr, state->client_conf->ports[port_id].ip_addr, 4);
 	rte_memcpy(&ip->dst_addr, state->server_conf->ports[server_port_id].ip_addr, 4);
 
 	uint16_t packet_length = (uint16_t)(constr_state->next_key - (uint8_t *)packet);
-	ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr)));
+	ip->total_length = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr)));
 
 	// assume the previous checksum was calculated with both IP addresses = 0 and total_length = 0
 	mehcached_update_ip_checksum(ip, 0, (uint16_t)(ip->src_addr >> 16));
@@ -437,32 +455,33 @@ mehcached_client_send_packet(struct client_state *state, struct packet_construct
 	mehcached_update_ip_checksum(ip, 0, (uint16_t)(ip->dst_addr >> 0));
 	mehcached_update_ip_checksum(ip, 0, ip->total_length);
 
-	udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr)));
+	udp->dgram_len = rte_cpu_to_be_16((uint16_t)(packet_length - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr)));
 
-	constr_state->mbuf->pkt.data_len = packet_length;
-	constr_state->mbuf->pkt.pkt_len = (uint32_t)packet_length;
+	rte_pktmbuf_data_len(constr_state->mbuf) = packet_length;
+	rte_pktmbuf_pkt_len(constr_state->mbuf) = (uint32_t)packet_length;
 
 #ifndef NDEBUG
-    rte_mbuf_sanity_check(constr_state->mbuf, RTE_MBUF_PKT, 1);
-    assert(rte_pktmbuf_headroom(constr_state->mbuf) + constr_state->mbuf->pkt.data_len <= constr_state->mbuf->buf_len);
+	rte_mbuf_sanity_check(constr_state->mbuf, 1);
+	assert(rte_pktmbuf_headroom(constr_state->mbuf) + rte_pktmbuf_data_len(constr_state->mbuf) <= constr_state->mbuf->buf_len);
 #endif
 
 	mehcached_send_packet(port_id, constr_state->mbuf);
 	constr_state->mbuf = NULL;
 
-    state->bytes_tx += (uint64_t)(packet_length + 24);	// 24 for PHY overheads
+	state->bytes_tx += (uint64_t)(packet_length + 24);	// 24 for PHY overheads
 }
 
 static
 void
 mehcached_remote_schedule_request(struct client_state *state, uint8_t operation, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time)
 {
-	uint8_t thread_id = (uint8_t)rte_lcore_id();
+	uint8_t lcore = (uint8_t)rte_lcore_id();
+	uint8_t thread_id = mehcached_lcore_to_thread_id[lcore];
 	struct mehcached_workload_thread_conf *thread_conf = &state->workload_conf->threads[thread_id];
 
 	// uint32_t opaque = (uint32_t)state->num_operations_done;
 
-    uint16_t partition_id = (uint16_t)(key_hash >> 48) & (uint16_t)(state->server_conf->num_partitions - 1);
+	uint16_t partition_id = (uint16_t)(key_hash >> 48) & (uint16_t)(state->server_conf->num_partitions - 1);
 
 	uint16_t mapping_id = (uint16_t)-1;
 	bool spread_requests = false;
@@ -524,22 +543,23 @@ mehcached_remote_schedule_request(struct client_state *state, uint8_t operation,
 		constr_state = state->constr_state_h + (mapping_id - 2048);
 
 	if (mehcached_need_to_init_packet(state, constr_state))
-		mehcached_init_packet(state, constr_state, thread_conf->batch_size, mapping_id);
+		mehcached_init_packet(state, constr_state, thread_conf->batch_size, mapping_id, expire_time);
 
 	mehcached_append_request(state, constr_state, operation, key_hash, key, key_length, value, value_length, expire_time);
 
 	if (mehcached_need_to_send_packet(state, constr_state))
 	{
-		uint8_t port_id;
+		uint8_t port_id = 1;
 		// XXX: assume that the top half is for (mapping_id & 1) == 0 and the bottom half is for (mapping_id & 1) == 1
-		if (spread_requests)
-			port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (mapping_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> (1 + state->port_mode))];
-		else
-		{
-			//port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (partition_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> 1)];
-			// this following allows putting all partitions to one thread (MEMCACHED) rather than sending requests to both NUMA domains
-			port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (state->server_conf->partitions[partition_id].thread_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> (1 + state->port_mode))];
-		}
+		// if (spread_requests)
+		// 	// port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (mapping_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> (1 + state->port_mode))];
+		// 	port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (mapping_id & 1) + state->next_port_index_tx % (thread_conf->num_ports)];
+		// else
+		// {
+		// 	//port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (partition_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> 1)];
+		// 	// this following allows putting all partitions to one thread (MEMCACHED) rather than sending requests to both NUMA domains
+		// 	port_id = thread_conf->port_ids[(thread_conf->num_ports >> 1) * (state->server_conf->partitions[partition_id].thread_id & 1) + state->next_port_index_tx % (thread_conf->num_ports >> (1 + state->port_mode))];
+		// }
 
 		mehcached_client_send_packet(state, constr_state, port_id);
 
@@ -565,16 +585,17 @@ mehcached_remote_noop_write(struct client_state *state, uint64_t key_hash, const
 
 static
 void
-mehcached_remote_set(struct client_state *state, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, bool overwrite)
+mehcached_remote_set(struct client_state *state, uint64_t key_hash, const uint8_t *key, size_t key_length, const uint8_t *value, size_t value_length, uint32_t expire_time, bool overwrite, uint64_t key_index)
 {
-	mehcached_remote_schedule_request(state, overwrite ? MEHCACHED_SET : MEHCACHED_ADD, key_hash, key, key_length, value, value_length, expire_time);
+	// mehcached_remote_schedule_request(state, overwrite ? MEHCACHED_SET : MEHCACHED_ADD, key_hash, key, key_length, value, value_length, expire_time);
+	mehcached_remote_schedule_request(state, overwrite ? MEHCACHED_SET : MEHCACHED_ADD, key_hash, key, key_length, value, value_length, key_index);
 }
 
 static
 void
-mehcached_remote_get(struct client_state *state, uint64_t key_hash, const uint8_t *key, size_t key_length)
+mehcached_remote_get(struct client_state *state, uint64_t key_hash, const uint8_t *key, size_t key_length, uint64_t key_index)
 {
-	mehcached_remote_schedule_request(state, MEHCACHED_GET, key_hash, key, key_length, NULL, 0, 0);
+	mehcached_remote_schedule_request(state, MEHCACHED_GET, key_hash, key, key_length, NULL, 0, key_index); // HACK: key_index in expire_time
 }
 
 static
@@ -602,10 +623,10 @@ static
 int
 mehcached_benchmark_client_proc(void *arg)
 {
-    struct client_state **states = (struct client_state **)arg;
-
-    uint8_t thread_id = (uint8_t)rte_lcore_id();
-    struct client_state *state = states[thread_id];
+	struct client_state **states = (struct client_state **)arg;
+	uint8_t lcore = (uint8_t)rte_lcore_id();
+	uint8_t thread_id = mehcached_lcore_to_thread_id[lcore];
+	struct client_state *state = states[thread_id];
 	struct mehcached_client_conf *client_conf = state->client_conf;
 	struct mehcached_workload_thread_conf *thread_conf = &state->workload_conf->threads[thread_id];
 
@@ -618,94 +639,97 @@ mehcached_benchmark_client_proc(void *arg)
 	memset(key, 0, sizeof(key));
 	memset(value, 0, sizeof(value));
 
-    size_t log16_num_items = 0;
-    while (((size_t)1 << (log16_num_items * 4)) < (thread_conf->num_items + 1))
-        log16_num_items++;
-    size_t key_position_step = thread_conf->key_length / log16_num_items;
-    if (key_position_step == 0)
-        key_position_step = 1;
-    // printf("%lu %lu %lu\n", key_position_step, log16_num_items, thread_conf->key_length);
-    assert(key_position_step * log16_num_items <= thread_conf->key_length);
+	size_t log16_num_items = 0;
+	while (((size_t)1 << (log16_num_items * 4)) < (thread_conf->num_items + 1))
+		log16_num_items++;
+	size_t key_position_step = thread_conf->key_length / log16_num_items;
+	if (key_position_step == 0)
+		key_position_step = 1;
+	// printf("%lu %lu %lu\n", key_position_step, log16_num_items, thread_conf->key_length);
+	assert(key_position_step * log16_num_items <= thread_conf->key_length);
 
 	uint64_t op_type_rand_state = (uint64_t)thread_id ^ mehcached_stopwatch_now();
+	uint64_t nic_rand_state = (uint64_t)thread_id ^ mehcached_stopwatch_now() ^ 0xffffffffffffffffULL;
 
-    uint64_t t_start;
-    uint64_t t_end;
+	uint64_t t_start;
+	uint64_t t_end;
 	double diff;
 	double prev_report = 0.;
-    double prev_rate_update = 0.;
+	double prev_rate_update = 0.;
 #ifdef MEHCACHED_MEASURE_LATENCY
-    double prev_latency_report = 0.;
+	double prev_latency_report = 0.;
 #endif
 
-    t_start = mehcached_stopwatch_now();
+	t_start = mehcached_stopwatch_now();
 
-    uint64_t i = 0;
+	uint64_t i = 0;
 
-    double get_ratio = thread_conf->get_ratio;
-    double put_ratio = thread_conf->put_ratio;
-    double abs_get_ratio = get_ratio;
-    double abs_put_ratio = put_ratio;
-    if (abs_get_ratio < 0.)
-    	abs_get_ratio = -abs_get_ratio;
-    if (abs_put_ratio < 0.)
-    	abs_put_ratio = -abs_put_ratio;
+	double get_ratio = thread_conf->get_ratio;
+	double put_ratio = thread_conf->put_ratio;
+	double abs_get_ratio = get_ratio;
+	double abs_put_ratio = put_ratio;
+	if (abs_get_ratio < 0.)
+		abs_get_ratio = -abs_get_ratio;
+	if (abs_put_ratio < 0.)
+		abs_put_ratio = -abs_put_ratio;
 
-    const uint32_t get_threshold = (uint32_t)(abs_get_ratio * (double)((uint32_t)-1));
-    const uint32_t put_threshold = (uint32_t)((abs_get_ratio + abs_put_ratio) * (double)((uint32_t)-1));
+	const uint32_t get_threshold = (uint32_t)(abs_get_ratio * (double)((uint32_t)-1));
+	const uint32_t put_threshold = (uint32_t)((abs_get_ratio + abs_put_ratio) * (double)((uint32_t)-1));
+	const uint32_t nic_threshold = (uint32_t)((nic_ratio) * (double)((uint32_t)-1));
 
-    int packet_index;
-    const int num_batch_proc_packets = 32;
+	int packet_index;
+	const int num_batch_proc_packets = 32;
 
-    state->rx_sample_rand_state = (uint64_t)thread_id ^ mehcached_stopwatch_now();
-    state->rx_sample_v = 0;	// will be set later
+	state->rx_sample_rand_state = (uint64_t)thread_id ^ mehcached_stopwatch_now();
+	state->rx_sample_v = 0;	// will be set later
 
 #ifdef MEHCACHED_ENABLE_THROTTLING
-    uint64_t batch_t_start = mehcached_stopwatch_now();
-    uint64_t batch_t_end = batch_t_start;
+	uint64_t batch_t_start = mehcached_stopwatch_now();
+	uint64_t batch_t_end = batch_t_start;
 #endif
 
-    // uint64_t last_ipackets[client_conf->num_ports];
-    // uint64_t last_ierrors[client_conf->num_ports];
-    uint64_t last_opackets[client_conf->num_ports];
-    uint64_t last_oerrors[client_conf->num_ports];
+	// uint64_t last_ipackets[client_conf->num_ports];
+	// uint64_t last_ierrors[client_conf->num_ports];
+	uint64_t last_opackets[client_conf->num_ports];
+	uint64_t last_oerrors[client_conf->num_ports];
 
-    if (thread_id == 0)
-    {
-        uint8_t port_id;
-        for (port_id = 0; port_id < client_conf->num_ports; port_id++)
-        {
-            // struct rte_eth_stats stats;
-            // rte_eth_stats_get(port_id, &stats);
+	if (thread_id == 0)
+	{
+		uint8_t port_id;
+		for (port_id = 0; port_id < client_conf->num_ports; port_id++)
+		{
+			// struct rte_eth_stats stats;
+			// rte_eth_stats_get(port_id, &stats);
 
-            // last_ipackets[port_id] = stats.ipackets;
-            // last_ierrors[port_id] = stats.ierrors;
-            // last_opackets[port_id] = stats.opackets;
-            // last_oerrors[port_id] = stats.oerrors;
+			// last_ipackets[port_id] = stats.ipackets;
+			// last_ierrors[port_id] = stats.ierrors;
+			// last_opackets[port_id] = stats.opackets;
+			// last_oerrors[port_id] = stats.oerrors;
 
-            uint64_t opackets = 0;
-            uint64_t oerrors = 0;
-            uint8_t thread_id;
-            for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
-            {
-                uint64_t num_tx_sent;
-                uint64_t num_tx_dropped;
-                mehcached_get_stats_lcore(port_id, thread_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
-                opackets += num_tx_sent;
-                oerrors += num_tx_dropped;
-                // XXX: how to handle integer wraps after a very long run?
-            }
-            last_opackets[port_id] = opackets;
-            last_oerrors[port_id] = oerrors;
-        }
-    }
+			uint64_t opackets = 0;
+			uint64_t oerrors = 0;
+			uint8_t thread_id;
+			// for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
+			RTE_LCORE_FOREACH(thread_id)
+			{
+				uint64_t num_tx_sent;
+				uint64_t num_tx_dropped;
+				mehcached_get_stats_lcore(port_id, thread_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
+				opackets += num_tx_sent;
+				oerrors += num_tx_dropped;
+				// XXX: how to handle integer wraps after a very long run?
+			}
+			last_opackets[port_id] = opackets;
+			last_oerrors[port_id] = oerrors;
+		}
+	}
 
-    while (!exiting)
+	while (!exiting)
 	{
 		if (thread_conf->num_operations != 0 && state->num_operations_done >= thread_conf->num_operations)
 			break;
- #ifdef MEHCACHED_ENABLE_THROTTLING
-	    uint64_t num_new_requests = 0;
+#ifdef MEHCACHED_ENABLE_THROTTLING
+		uint64_t num_new_requests = 0;
 #endif
 
 		for (packet_index = 0; packet_index < num_batch_proc_packets; packet_index++)
@@ -714,8 +738,22 @@ mehcached_benchmark_client_proc(void *arg)
 			bool is_get = op_r <= get_threshold;
 			bool is_put = op_r > get_threshold && op_r <= put_threshold;
 			bool is_increment = op_r > put_threshold;
+			bool is_force_nic = (is_put && force_nic_set); // force all sets to nicmem to show worst-case
+			uint64_t key_index;
 
-			uint64_t key_index = mehcached_zipf_next(&state->gen_state);
+			key_index = mehcached_zipf_next(&state->gen_state);
+			if (nic_ratio <= 1.0) { // TODO use in test.sh
+				uint32_t nic_r = mehcached_rand(&nic_rand_state);
+				// printf("prev key idx %llx", key_index);
+				if (nic_r <= nic_threshold || is_force_nic) {
+					key_index &= (nic_num - 1);
+				} else if (key_index < nic_num) {
+					key_index += nic_num;
+					// while (key_index < nic_num)
+					// 	key_index = mehcached_zipf_next(&state->gen_state);
+				}
+				// printf(" new key idx %llx\n", key_index);
+			}
 			assert(key_index < thread_conf->num_items);
 			uint64_t key_hash = mehcached_hash_key(key_index);
 
@@ -730,7 +768,7 @@ mehcached_benchmark_client_proc(void *arg)
 				{
 					size_t i;
 					for (i = 0; i < sizeof(key) / sizeof(key[0]); i++)
-		                key[i] = 0;     // for keys that need zero paddings to an 8-byte boundary
+						key[i] = 0;     // for keys that need zero paddings to an 8-byte boundary
 					uint64_t key_index_copy = key_index + 1;
 					while (key_index_copy > 0)
 					{
@@ -746,11 +784,12 @@ mehcached_benchmark_client_proc(void *arg)
 						key_index_copy >>= 4;
 					}
 				}
+				// printf("key index %d key len %d key hash %llx partition %d\n", key_index, key_length, key_hash, (key_hash >> 48) & 3);
 
 				if (is_get)
 				{
 					if (get_ratio >= 0.)
-						mehcached_remote_get(state, key_hash, (const uint8_t *)key, key_length);
+						mehcached_remote_get(state, key_hash, (const uint8_t *)key, key_length, key_index);
 					else
 						mehcached_remote_noop_read(state, key_hash, (const uint8_t *)key, key_length);
 				}
@@ -758,7 +797,7 @@ mehcached_benchmark_client_proc(void *arg)
 				{
 					*(uint64_t *)value = (i & 0xffffffff) | ((~i & 0xffffffff) << 32);
 					if (put_ratio >= 0.)
-						mehcached_remote_set(state, key_hash, (const uint8_t *)key, key_length, (const uint8_t *)value, thread_conf->value_length, 0, true);
+						mehcached_remote_set(state, key_hash, (const uint8_t *)key, key_length, (const uint8_t *)value, thread_conf->value_length, 0, true, key_index);
 					else
 						mehcached_remote_noop_write(state, key_hash, (const uint8_t *)key, key_length, (const uint8_t *)value, thread_conf->value_length, 0);
 				}
@@ -788,7 +827,7 @@ mehcached_benchmark_client_proc(void *arg)
 			min_target_request_rate = state->target_request_rate;
 		if (min_target_request_rate > 0)
 		{
-		    while (!exiting)
+			while (!exiting)
 			{
 #ifdef MEHCACHED_MEASURE_LATENCY
 				if (thread_id == 0)
@@ -800,22 +839,22 @@ mehcached_benchmark_client_proc(void *arg)
 				}
 #endif
 
-			    batch_t_end = mehcached_stopwatch_now();
-			    if (batch_t_start != batch_t_end)
-			    {
-				    double t_diff = mehcached_stopwatch_diff_in_s(batch_t_end, batch_t_start);
-				    if (t_diff >= 0.1)	// throttle no longer than 0.1 second (target_request rate may be too low)
-				    	break;
-				    uint32_t actual_request_rate = (uint32_t)((double)num_new_requests / t_diff);
-				    if (actual_request_rate <= min_target_request_rate)
-					    break;
+				batch_t_end = mehcached_stopwatch_now();
+				if (batch_t_start != batch_t_end)
+				{
+					double t_diff = mehcached_stopwatch_diff_in_s(batch_t_end, batch_t_start);
+					if (t_diff >= 0.1)	// throttle no longer than 0.1 second (target_request rate may be too low)
+						break;
+					uint32_t actual_request_rate = (uint32_t)((double)num_new_requests / t_diff);
+					if (actual_request_rate <= min_target_request_rate)
+						break;
 				}
 
 				// send out all buffered packets while waiting
 				size_t port_index;
-	            for (port_index = 0; port_index < thread_conf->num_ports; port_index++)
-	            {
-	                uint8_t port_id = thread_conf->port_ids[port_index];
+				for (port_index = 0; port_index < thread_conf->num_ports; port_index++)
+				{
+					uint8_t port_id = thread_conf->port_ids[port_index];
 					mehcached_send_packet_flush(port_id);
 				}
 			}
@@ -825,225 +864,235 @@ mehcached_benchmark_client_proc(void *arg)
 
 		i++;
 
-        if ((i & 0xff) == 0)
-        {
-            uint64_t total_num_tx_sent = 0;
-            uint64_t total_num_tx_dropped = 0;
-		    size_t port_index;
-            for (port_index = 0; port_index < thread_conf->num_ports; port_index++)
-            {
-                uint8_t port_id = thread_conf->port_ids[port_index];
-                uint64_t num_tx_sent;
-                uint64_t num_tx_dropped;
-                mehcached_get_stats(port_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
-                total_num_tx_sent += num_tx_sent;
-                total_num_tx_dropped += num_tx_dropped;
-            }
-            state->num_tx_sent = total_num_tx_sent;
-            state->num_tx_dropped = total_num_tx_dropped;
+		if ((i & 0xff) == 0)
+		{
+			uint64_t total_num_tx_sent = 0;
+			uint64_t total_num_tx_dropped = 0;
+			size_t port_index;
+			for (port_index = 0; port_index < thread_conf->num_ports; port_index++)
+			{
+				uint8_t port_id = thread_conf->port_ids[port_index];
+				uint64_t num_tx_sent;
+				uint64_t num_tx_dropped;
+				mehcached_get_stats(port_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
+				total_num_tx_sent += num_tx_sent;
+				total_num_tx_dropped += num_tx_dropped;
+			}
+			state->num_tx_sent = total_num_tx_sent;
+			state->num_tx_dropped = total_num_tx_dropped;
 
-            t_end = mehcached_stopwatch_now();
-            diff = mehcached_stopwatch_diff_in_s(t_end, t_start);
+			t_end = mehcached_stopwatch_now();
+			diff = mehcached_stopwatch_diff_in_s(t_end, t_start);
 
-    		if (diff - prev_report >= 1.)
-    		{
-                if (thread_id == 0)
-                {
-        			uint64_t total_new_num_tx_sent = 0;
-        			uint64_t total_new_num_tx_dropped = 0;
-        			uint64_t total_new_bytes_rx = 0;
-        			uint64_t total_new_bytes_tx = 0;
-                    uint64_t total_new_num_operations_done = 0;
-                    uint64_t total_new_num_key0_operations_done = 0;
-                    uint64_t total_new_num_operations_succeeded = 0;
-                    size_t num_active_threads = 0;
+			if (diff - prev_report >= 1.)
+			{
+				if (thread_id == 0)
+				{
+					uint64_t total_new_num_tx_sent = 0;
+					uint64_t total_new_num_tx_dropped = 0;
+					uint64_t total_new_bytes_rx = 0;
+					uint64_t total_new_bytes_tx = 0;
+					uint64_t total_new_num_operations_done = 0;
+					uint64_t total_new_num_key0_operations_done = 0;
+					uint64_t total_new_num_operations_succeeded = 0;
+					size_t num_active_threads = 0;
 
-                    size_t thread_id;
-                    for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
-                    {
-                        uint64_t num_tx_sent = states[thread_id]->num_tx_sent;
-                        uint64_t new_num_tx_sent = num_tx_sent - states[thread_id]->last_num_tx_sent;
-                        states[thread_id]->last_num_tx_sent = num_tx_sent;
+					size_t thread_id;
+					for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
+					{
+						uint64_t num_tx_sent = states[thread_id]->num_tx_sent;
+						uint64_t new_num_tx_sent = num_tx_sent - states[thread_id]->last_num_tx_sent;
+						states[thread_id]->last_num_tx_sent = num_tx_sent;
 
-                        uint64_t num_tx_dropped = states[thread_id]->num_tx_dropped;
-                        uint64_t new_num_tx_dropped = num_tx_dropped - states[thread_id]->last_num_tx_dropped;
-                        states[thread_id]->last_num_tx_dropped = num_tx_dropped;
+						uint64_t num_tx_dropped = states[thread_id]->num_tx_dropped;
+						uint64_t new_num_tx_dropped = num_tx_dropped - states[thread_id]->last_num_tx_dropped;
+						states[thread_id]->last_num_tx_dropped = num_tx_dropped;
 
-                        uint64_t bytes_rx = states[thread_id]->bytes_rx;
-                        uint64_t new_bytes_rx = bytes_rx - states[thread_id]->last_bytes_rx;
-                        states[thread_id]->last_bytes_rx = bytes_rx;
+						uint64_t bytes_rx = states[thread_id]->bytes_rx;
+						uint64_t new_bytes_rx = bytes_rx - states[thread_id]->last_bytes_rx;
+						states[thread_id]->last_bytes_rx = bytes_rx;
 
-                        uint64_t bytes_tx = states[thread_id]->bytes_tx;
-                        uint64_t new_bytes_tx = bytes_tx - states[thread_id]->last_bytes_tx;
-                        states[thread_id]->last_bytes_tx = bytes_tx;
+						uint64_t bytes_tx = states[thread_id]->bytes_tx;
+						uint64_t new_bytes_tx = bytes_tx - states[thread_id]->last_bytes_tx;
+						states[thread_id]->last_bytes_tx = bytes_tx;
 
-                        uint64_t num_operations_done = states[thread_id]->num_operations_done;
-                        uint64_t new_num_operations_done = num_operations_done - states[thread_id]->last_num_operations_done;
-                        states[thread_id]->last_num_operations_done = num_operations_done;
+						uint64_t num_operations_done = states[thread_id]->num_operations_done;
+						uint64_t new_num_operations_done = num_operations_done - states[thread_id]->last_num_operations_done;
+						states[thread_id]->last_num_operations_done = num_operations_done;
 
-                        uint64_t num_key0_operations_done = states[thread_id]->num_key0_operations_done;
-                        uint64_t new_num_key0_operations_done = num_key0_operations_done - states[thread_id]->last_num_key0_operations_done;
-                        states[thread_id]->last_num_key0_operations_done = num_key0_operations_done;
+						uint64_t num_key0_operations_done = states[thread_id]->num_key0_operations_done;
+						uint64_t new_num_key0_operations_done = num_key0_operations_done - states[thread_id]->last_num_key0_operations_done;
+						states[thread_id]->last_num_key0_operations_done = num_key0_operations_done;
 
-                        uint64_t num_operations_succeeded = states[thread_id]->num_operations_succeeded;
-                        uint64_t new_num_operations_succeeded = num_operations_succeeded - states[thread_id]->last_num_operations_succeeded;
-                        states[thread_id]->last_num_operations_succeeded = num_operations_succeeded;
+						uint64_t num_operations_succeeded = states[thread_id]->num_operations_succeeded;
+						uint64_t new_num_operations_succeeded = num_operations_succeeded - states[thread_id]->last_num_operations_succeeded;
+						states[thread_id]->last_num_operations_succeeded = num_operations_succeeded;
 
-                        total_new_num_tx_sent += new_num_tx_sent;
-                        total_new_num_tx_dropped += new_num_tx_dropped;
-                        total_new_bytes_rx += new_bytes_rx;
-                        total_new_bytes_tx += new_bytes_tx;
-                        total_new_num_operations_done += new_num_operations_done;
-                        total_new_num_key0_operations_done += new_num_key0_operations_done;
-                        total_new_num_operations_succeeded += new_num_operations_succeeded;
+						total_new_num_tx_sent += new_num_tx_sent;
+						total_new_num_tx_dropped += new_num_tx_dropped;
+						total_new_bytes_rx += new_bytes_rx;
+						total_new_bytes_tx += new_bytes_tx;
+						total_new_num_operations_done += new_num_operations_done;
+						total_new_num_key0_operations_done += new_num_key0_operations_done;
+						total_new_num_operations_succeeded += new_num_operations_succeeded;
 
-                        if (new_bytes_tx != 0)
-                        	num_active_threads++;
-                    }
+						if (new_bytes_tx != 0)
+							num_active_threads++;
+					}
 
-                    double effective_tx_ratio = 0.;
-                    if (total_new_num_tx_sent + total_new_num_tx_dropped != 0)
-	                    effective_tx_ratio = (double)total_new_num_tx_sent / (double)(total_new_num_tx_sent + total_new_num_tx_dropped);
+					double effective_tx_ratio = 0.;
+					if (total_new_num_tx_sent + total_new_num_tx_dropped != 0)
+						effective_tx_ratio = (double)total_new_num_tx_sent / (double)(total_new_num_tx_sent + total_new_num_tx_dropped);
 
-                    double success_rate = 0.;
-                    if (total_new_num_operations_done != 0 && effective_tx_ratio > 0.)
-                    {
-                    	success_rate = (double)total_new_num_operations_succeeded / ((double)total_new_num_operations_done * effective_tx_ratio);
-                    	if (success_rate > 1.)
-                    		success_rate = 1.;	// total_new_num_operations_succeeded & total_new_num_operations_done are measured for a different set of requests
-                    }
+					double success_rate = 0.;
+					if (total_new_num_operations_done != 0 && effective_tx_ratio > 0.)
+					{
+						success_rate = (double)total_new_num_operations_succeeded / ((double)total_new_num_operations_done * effective_tx_ratio);
+						if (success_rate > 1.)
+							success_rate = 1.;	// total_new_num_operations_succeeded & total_new_num_operations_done are measured for a different set of requests
+					}
 
-                    double total_mops = (double)total_new_num_operations_done * effective_tx_ratio;
-                    double key0_mops;
-                    if (total_new_num_operations_done != 0)
-	                    key0_mops = total_mops * ((double)total_new_num_key0_operations_done / (double)total_new_num_operations_done);
-	                else
-	                	key0_mops = 0.;
-                    total_mops *= 1. / (diff - prev_report) * 0.000001;
-                    key0_mops *= 1. / (diff - prev_report) * 0.000001;
-                    double gbps_rx = (double)total_new_bytes_rx / (diff - prev_report) * 8 * 0.000000001;
-                    double gbps_tx = (double)total_new_bytes_tx / (diff - prev_report) * 8 * 0.000000001 * effective_tx_ratio;
+					double total_mops = (double)total_new_num_operations_done * effective_tx_ratio;
+					double key0_mops;
+					if (total_new_num_operations_done != 0)
+						key0_mops = total_mops * ((double)total_new_num_key0_operations_done / (double)total_new_num_operations_done);
+					else
+						key0_mops = 0.;
+					total_mops *= 1. / (diff - prev_report) * 0.000001;
+					key0_mops *= 1. / (diff - prev_report) * 0.000001;
+					double gbps_rx = (double)total_new_bytes_rx / (diff - prev_report) * 8 * 0.000000001;
+					double gbps_tx = (double)total_new_bytes_tx / (diff - prev_report) * 8 * 0.000000001 * effective_tx_ratio;
 
-                    printf("%.1f current_ops: %10.2lf Mops (%10.2lf Mops for key0); success_rate: %3.2f%%", diff, total_mops, key0_mops, success_rate * 100.);
+					printf("%.1f current_ops: %10.2lf Mops (%10.2lf Mops for key0); success_rate: %3.2f%%", diff, total_mops, key0_mops, success_rate * 100.);
 
-                    printf("; bw: %.2lf Gbps (rx), %.2lf Gbps (tx); threads: %zu", gbps_rx, gbps_tx, num_active_threads);
+					printf("; bw: %.2lf Gbps (rx), %.2lf Gbps (tx); threads: %zu", gbps_rx, gbps_tx, num_active_threads);
 
-                    printf("; target_request_rate: %.3f Mops (c), %.3f Mops (s)", (float)state->target_request_rate * 0.000001f, (float)state->target_request_rate_at_server * 0.000001f);
+					printf("; target_request_rate: %.3f Mops (c), %.3f Mops (s)", (float)state->target_request_rate * 0.000001f, (float)state->target_request_rate_at_server * 0.000001f);
 
-	                printf("\n");
-	                fflush(stdout);
-                }
+					printf("\n");
+					fflush(stdout);
+				}
 
-    			prev_report = diff;
-            }
+				prev_report = diff;
+			}
 
 #ifdef MEHCACHED_MEASURE_LATENCY
 			// do not record latency for 1 second after dumping the histogram to the file
 			// because latency data is distorted by the file write
-    		if (diff - prev_latency_report >= 1.)
-    		{
-                if (thread_id == 0)
-                	if (!state->record_latency)
-                		state->record_latency = 1;
-    		}
-    		if (diff - prev_latency_report >= 10.)
-    		{
-                if (thread_id == 0)
-                {
-                	FILE *fp = fopen("output_latency.tmp", "wb");
-	                uint32_t latency_bin_index;
-	                for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
-	                	fprintf(fp, "%4u %6u\n", 0 + latency_bin_index * 1, state->latency_bin0[latency_bin_index]);
-	                for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
-	                	fprintf(fp, "%4u %6u\n", 128 + latency_bin_index * 2, state->latency_bin1[latency_bin_index]);
-	                for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
-	                	fprintf(fp, "%4u %6u\n", 384  + latency_bin_index * 4, state->latency_bin2[latency_bin_index]);
-	                for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
-	                	fprintf(fp, "%4u %6u\n", 896  + latency_bin_index * 8, state->latency_bin3[latency_bin_index]);
-                	fprintf(fp, "%4u %6u\n", 1920, state->latency_bin4);
-                	fclose(fp);
+			if (diff - prev_latency_report >= 1.)
+			{
+				// if (thread_id == 0) {
+					if (state->record_latency == 0) {
+						state->record_latency = 1;
+					}
+				//}
+			}
+			if (diff - prev_latency_report >= 10.)
+			{
+				uint8_t tid = thread_id;
+				//for (tid = 0; tid < state->workload_conf->num_threads; tid++)
+				{
+					//struct client_state *_state = states[tid];
+					struct client_state *_state = state;
+					char fname[256];
+					snprintf(&fname, 255, "output_latency.%d.tmp", tid);
+					FILE *fp = fopen(fname, "wb");
+					uint32_t latency_bin_index;
+					for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
+						fprintf(fp, "%4u %6u\n", 0 + latency_bin_index * 1, _state->latency_bin0[latency_bin_index]);
+					for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
+						fprintf(fp, "%4u %6u\n", 128 + latency_bin_index * 2, _state->latency_bin1[latency_bin_index]);
+					for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
+						fprintf(fp, "%4u %6u\n", 384  + latency_bin_index * 4, _state->latency_bin2[latency_bin_index]);
+					for (latency_bin_index = 0; latency_bin_index < 128; latency_bin_index++)
+						fprintf(fp, "%4u %6u\n", 896  + latency_bin_index * 8, _state->latency_bin3[latency_bin_index]);
+					fprintf(fp, "%4u %6u\n", 1920, _state->latency_bin4);
+					fclose(fp);
 
-	                memset(state->latency_bin0, 0, sizeof(state->latency_bin0));
-	                memset(state->latency_bin1, 0, sizeof(state->latency_bin1));
-	                memset(state->latency_bin2, 0, sizeof(state->latency_bin2));
-	                memset(state->latency_bin3, 0, sizeof(state->latency_bin3));
-	                state->latency_bin4 = 0;
+					memset(_state->latency_bin0, 0, sizeof(_state->latency_bin0));
+					memset(_state->latency_bin1, 0, sizeof(_state->latency_bin1));
+					memset(_state->latency_bin2, 0, sizeof(_state->latency_bin2));
+					memset(_state->latency_bin3, 0, sizeof(_state->latency_bin3));
+					_state->latency_bin4 = 0;
 
-	                printf("latency report written to output_latency.tmp\n");
-	            }
-                prev_latency_report = diff;
-        		state->record_latency = 0;
-	        }
+					printf("latency report written to output_latency.%d.tmp\n", tid);
+				}
+				prev_latency_report = diff;
+				state->record_latency = 0;
+			}
 #endif
 
-            if (diff - prev_rate_update >= 0.1)
-            {
-                if (thread_id == 0)
-                {
-                    float max_loss = 0.;
+			if (diff - prev_rate_update >= 0.1)
+			{
+				if (thread_id == 0)
+				{
+					float max_loss = 0.;
 
-                    uint8_t port_id;
-		            for (port_id = 0; port_id < client_conf->num_ports; port_id++)
-		            {
-		            	uint64_t opackets = 0;
-		            	uint64_t oerrors = 0;
-		            	uint8_t thread_id;
-                        for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
-                        {
-                            uint64_t num_tx_sent;
-                            uint64_t num_tx_dropped;
-                            mehcached_get_stats_lcore(port_id, thread_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
-			                opackets += num_tx_sent;
-			                oerrors += num_tx_dropped;
-			                // XXX: how to handle integer wraps after a very long run?
-			            }
-			            uint64_t new_opackets = opackets - last_opackets[port_id];
-			            last_opackets[port_id] = opackets;
-			            uint64_t new_oerrors = oerrors - last_oerrors[port_id];
-			            last_oerrors[port_id] = oerrors;
+					uint8_t port_id;
+					for (port_id = 0; port_id < client_conf->num_ports; port_id++)
+					{
+						uint64_t opackets = 0;
+						uint64_t oerrors = 0;
+						uint8_t thread_id;
+						//for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
+						RTE_LCORE_FOREACH(thread_id)
+						{
+							uint64_t num_tx_sent;
+							uint64_t num_tx_dropped;
+							mehcached_get_stats_lcore(port_id, thread_id, NULL, NULL, NULL, &num_tx_sent, &num_tx_dropped);
+							opackets += num_tx_sent;
+							oerrors += num_tx_dropped;
+							// XXX: how to handle integer wraps after a very long run?
+						}
+						uint64_t new_opackets = opackets - last_opackets[port_id];
+						last_opackets[port_id] = opackets;
+						uint64_t new_oerrors = oerrors - last_oerrors[port_id];
+						last_oerrors[port_id] = oerrors;
 
-			            float oloss;
-                        if (new_opackets + new_oerrors != 0)
-                            oloss = (float)new_oerrors / (float)(new_opackets + new_oerrors);
-			           	else
-			           		oloss = 0.f;
+						float oloss;
+						if (new_opackets + new_oerrors != 0)
+							oloss = (float)new_oerrors / (float)(new_opackets + new_oerrors);
+						else
+							oloss = 0.f;
 
-			           	if (max_loss < oloss)
-			           		max_loss = oloss;
-		            }
+						if (max_loss < oloss)
+							max_loss = oloss;
+					}
 
-                    uint32_t new_target_request_rate;
-                    if (max_loss <= 0.01f)
-                        new_target_request_rate = (uint32_t)((float)state->target_request_rate * (1.f + (0.01f - max_loss)));
-                    else if (max_loss <= 0.02f)
-                        new_target_request_rate = (uint32_t)((float)state->target_request_rate / (1.f + (max_loss - 0.01f)));
-                    else
-                        new_target_request_rate = (uint32_t)((float)state->target_request_rate / (1.f + (0.02f - 0.01f)));
-                    if (new_target_request_rate < 1000) // cap at 1 Kops
-                        new_target_request_rate = 1000;
-                    if (new_target_request_rate > 20000000) // cap at 20 Mops
-                        new_target_request_rate = 20000000;
+					uint32_t new_target_request_rate;
+					if (max_loss <= 0.01f)
+						new_target_request_rate = (uint32_t)((float)state->target_request_rate * (1.f + (0.01f - max_loss)));
+					else if (max_loss <= 0.02f)
+						new_target_request_rate = (uint32_t)((float)state->target_request_rate / (1.f + (max_loss - 0.01f)));
+					else
+						new_target_request_rate = (uint32_t)((float)state->target_request_rate / (1.f + (0.02f - 0.01f)));
+					if (new_target_request_rate < 1000) // cap at 1 Kops
+						new_target_request_rate = 1000;
+					if (new_target_request_rate > mehcached_max_request_rate ) // cap at 20 Mops
+						new_target_request_rate = mehcached_max_request_rate;
+					// if (new_target_request_rate > 500000) // cap at 20 Mops
+					// 	new_target_request_rate = 500000;
 
-                    uint8_t thread_id;
-                    for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
-                        states[thread_id]->target_request_rate = new_target_request_rate;
-                }
+					uint8_t thread_id;
+					for (thread_id = 0; thread_id < state->workload_conf->num_threads; thread_id++)
+						states[thread_id]->target_request_rate = new_target_request_rate;
+				}
 
-                prev_rate_update = diff;
+				prev_rate_update = diff;
 
-// #ifdef MEHCACHED_MEASURE_LATENCY
-//                 {
-//                 	// copy thread 0's target_request_rate_at_server to other threads because only thread 0 is receiving response packets
-//                     uint8_t thread_id;
-//                     for (thread_id = 1; thread_id < state->workload_conf->num_threads; thread_id++)
-//                         states[thread_id]->target_request_rate_at_server = states[0]->target_request_rate_at_server;
-//                 }
-// #endif
-            }
+				// #ifdef MEHCACHED_MEASURE_LATENCY
+				//                 {
+				//                 	// copy thread 0's target_request_rate_at_server to other threads because only thread 0 is receiving response packets
+				//                     uint8_t thread_id;
+				//                     for (thread_id = 1; thread_id < state->workload_conf->num_threads; thread_id++)
+				//                         states[thread_id]->target_request_rate_at_server = states[0]->target_request_rate_at_server;
+				//                 }
+				// #endif
+			}
 
-            if (thread_conf->duration != 0. && diff >= thread_conf->duration)
-            	break;
-        }
+			if (thread_conf->duration != 0. && diff >= thread_conf->duration)
+				break;
+		}
 	}
 
 	return 0;
@@ -1053,24 +1102,26 @@ static
 void
 mehcached_benchmark_client(const char *machine_filename, const char *client_name, int cpu_mode, int port_mode, int num_workloads, const char *workload_filenames[])
 {
-    struct mehcached_client_conf *client_conf = mehcached_get_client_conf(machine_filename, client_name);
+	struct mehcached_client_conf *client_conf = mehcached_get_client_conf(machine_filename, client_name);
 
 	mehcached_stopwatch_init_start();
 
-    printf("initializing DPDK\n");
+	printf("initializing DPDK\n");
 
-    uint64_t cpu_mask = ((uint64_t)1 << client_conf->num_threads) - 1;
+	uint64_t cpu_mask = ((uint64_t)1 << client_conf->num_threads * 2) - 1;
+	cpu_mask &= 0x555555;
 	char cpu_mask_str[10];
 	snprintf(cpu_mask_str, sizeof(cpu_mask_str), "%lx", cpu_mask);
 
+	printf("core_mask %s\n", cpu_mask_str);
 	char *rte_argv[] = {"",
 		"-c", cpu_mask_str,
-		"-n", "3",	// 3 for client0/1
+		"-b", "0000:5e:00.1",
 	};
 	int rte_argc = sizeof(rte_argv) / sizeof(rte_argv[0]);
 
-    //rte_set_log_level(RTE_LOG_DEBUG);
-    rte_set_log_level(RTE_LOG_NOTICE);
+	//rte_log_set_global_level(RTE_LOG_DEBUG);
+	rte_log_set_global_level(RTE_LOG_NOTICE);
 
 	int ret = rte_eal_init(rte_argc, rte_argv);
 	if (ret < 0)
@@ -1079,10 +1130,22 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 		return;
 	}
 
-    uint8_t thread_id;
+	uint8_t thread_id;
+	uint8_t lcore;
+	memset(mehcached_lcore_to_thread_id, -1, MEHCACHED_MAX_LCORES * sizeof(mehcached_lcore_to_thread_id[0]));
+	memset(mehcached_thread_id_to_lcore, -1, MEHCACHED_MAX_LCORES * sizeof(mehcached_thread_id_to_lcore[0]));
+	
+	RTE_LCORE_FOREACH(lcore)
+	{
+		mehcached_lcore_to_thread_id[lcore] = thread_id;
+		mehcached_thread_id_to_lcore[thread_id] = lcore;
+		printf("queue %hhu mapped to lcore %hu\n", thread_id, lcore);
+		thread_id++;
+	}
 
 	uint8_t num_ports_max;
-	uint64_t port_mask = ((size_t)1 << client_conf->num_ports) - 1;
+	// uint64_t port_mask = ((size_t)1 << client_conf->num_ports) - 1;
+	uint64_t port_mask = 0x2;
 	if (!mehcached_init_network(cpu_mask, port_mask, &num_ports_max))
 	{
 		fprintf(stderr, "failed to initialize network\n");
@@ -1092,64 +1155,68 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 
 
 	printf("setting MAC address\n");
-    uint8_t port_id;
-    for (port_id = 0; port_id < client_conf->num_ports; port_id++)
-    {
-    	struct ether_addr mac_addr;
-    	memcpy(&mac_addr, client_conf->ports[port_id].mac_addr, sizeof(struct ether_addr));
-    	if (rte_eth_dev_mac_addr_add(port_id, &mac_addr, 0) != 0)
-    	{
+	uint8_t port_id;
+	for (port_id = 0; port_id < client_conf->num_ports; port_id++)
+	{
+		struct rte_ether_addr mac_addr;
+		memcpy(&mac_addr, client_conf->ports[port_id].mac_addr, sizeof(struct rte_ether_addr));
+		if (rte_eth_dev_mac_addr_add(port_id, &mac_addr, 0) != 0)
+		{
 			fprintf(stderr, "failed to add a MAC address\n");
 			return;
-    	}
-    }
+		}
+	}
 
 
-    printf("configuring mappings\n");
+	printf("configuring mappings\n");
 
-    for (port_id = 0; port_id < client_conf->num_ports; port_id++)
-    {
-        if (!mehcached_set_dst_port_mask(port_id, 0xffff))
-            return;
-    }
-
-    for (thread_id = 0; thread_id < client_conf->num_threads; thread_id++)
-    {
-        for (port_id = 0; port_id < client_conf->num_ports; port_id++)
-            if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)thread_id, thread_id))
-                return;
-    }
-
-
-    printf("initializing client states\n");
-
-    struct client_state *states[client_conf->num_threads];
+	for (port_id = 0; port_id < client_conf->num_ports; port_id++)
+	{
+		if (!mehcached_set_dst_port_mask(port_id, 0xffff))
+			return;
+	}
 
 	for (thread_id = 0; thread_id < client_conf->num_threads; thread_id++)
-        states[thread_id] = mehcached_eal_malloc_lcore(sizeof(struct client_state), thread_id);
+	{
+		for (port_id = 1; port_id < client_conf->num_ports; port_id++)
+			// if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)thread_id, thread_id))
+			if (!mehcached_set_dst_port_mapping(port_id, (uint16_t)thread_id, mehcached_thread_id_to_lcore[thread_id]))
+				return;
+	}
+
+	printf("initializing %d client states\n", client_conf->num_threads);
+
+	struct client_state *states[client_conf->num_threads];
+
+	for (thread_id = 0; thread_id < client_conf->num_threads; thread_id++) {
+		//states[thread_id] = mehcached_eal_malloc_lcore(sizeof(struct client_state), thread_id);
+		states[thread_id] = rte_malloc("state", sizeof(struct client_state), 64);
+		printf("states[thread_id] = %d\n", sizeof(struct client_state));
+	}
 
 	mehcached_stopwatch_init_end();
 
 
-    printf("running clients\n");
+	printf("running clients\n");
 
-    struct sigaction new_action;
-    new_action.sa_handler = signal_handler;
-    sigemptyset(&new_action.sa_mask);
-    new_action.sa_flags = 0;
-    sigaction(SIGINT, &new_action, NULL);
-    sigaction(SIGTERM, &new_action, NULL);
+	struct sigaction new_action;
+	new_action.sa_handler = signal_handler;
+	sigemptyset(&new_action.sa_mask);
+	new_action.sa_flags = 0;
+	sigaction(SIGINT, &new_action, NULL);
+	sigaction(SIGTERM, &new_action, NULL);
 
-    int workload_index;
-    for (workload_index = 0; workload_index < num_workloads; workload_index++)
-    {
-    	struct mehcached_workload_conf *workload_conf = mehcached_get_workload_conf(workload_filenames[workload_index], client_name);
+	int workload_index;
+	for (workload_index = 0; workload_index < num_workloads; workload_index++)
+	{
+		struct mehcached_workload_conf *workload_conf = mehcached_get_workload_conf(workload_filenames[workload_index], client_name);
 
-	    printf("using workload %d\n", workload_index);
+		printf("using workload %d threads %d\n", workload_index, workload_conf->num_threads);
 
 		for (thread_id = 0; thread_id < workload_conf->num_threads; thread_id++)
 		{
-	        struct client_state *state = states[thread_id];
+			printf("thread_id %d\n", thread_id);
+			struct client_state *state = states[thread_id];
 			memset(state, 0, sizeof(struct client_state));
 
 			state->thread_id = thread_id;
@@ -1161,11 +1228,11 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 
 			uint16_t partition_id;
 			for (partition_id = 0; partition_id < MEHCACHED_MAX_PARTITIONS; partition_id++)
-		        state->partition_id_to_thread_id[partition_id] = (uint8_t)-1;
+				state->partition_id_to_thread_id[partition_id] = (uint8_t)-1;
 
 			if (thread_id == 0 ||
-				workload_conf->threads[thread_id - 1].num_items != workload_conf->threads[thread_id].num_items ||
-				workload_conf->threads[thread_id - 1].zipf_theta != workload_conf->threads[thread_id].zipf_theta)
+			    workload_conf->threads[thread_id - 1].num_items != workload_conf->threads[thread_id].num_items ||
+			    workload_conf->threads[thread_id - 1].zipf_theta != workload_conf->threads[thread_id].zipf_theta)
 			{
 				mehcached_zipf_init(&state->gen_state, workload_conf->threads[thread_id].num_items, workload_conf->threads[thread_id].zipf_theta, thread_id ^ mehcached_stopwatch_now());
 				mehcached_zipf_next(&state->gen_state);
@@ -1173,16 +1240,19 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 			else
 				mehcached_zipf_init_copy(&state->gen_state, &states[thread_id - 1]->gen_state, thread_id ^ mehcached_stopwatch_now());
 
-	        state->target_request_rate_at_server = 20000000;  // 20 Mops
-	        state->target_request_rate = 20000000;  // 20 Mops
+			state->target_request_rate_at_server =  mehcached_max_request_rate;  // 20 Mops
+			state->target_request_rate = mehcached_max_request_rate;  // 20 Mops
+			// state->target_request_rate_at_server = 500000;  // 20 Mops
+			// state->target_request_rate = 500000;  // 20 Mops
 
-	        state->cpu_mode = cpu_mode;
-	        state->port_mode = port_mode;
+			state->cpu_mode = cpu_mode;
+			state->port_mode = port_mode;
 		}
 
-	    for (thread_id = 1; thread_id < workload_conf->num_threads; thread_id++)
-			rte_eal_launch(mehcached_benchmark_client_proc, states, (unsigned int)thread_id);
-		rte_eal_launch(mehcached_benchmark_client_proc, states, 0);
+		// for (thread_id = 1; thread_id < workload_conf->num_threads; thread_id++)
+		// 	rte_eal_launch(mehcached_benchmark_client_proc, states, (unsigned int)thread_id);
+		// rte_eal_launch(mehcached_benchmark_client_proc, states, 0);
+		rte_eal_mp_remote_launch(mehcached_benchmark_client_proc, states, CALL_MASTER);
 
 		rte_eal_mp_wait_lcore();
 
@@ -1193,22 +1263,42 @@ mehcached_benchmark_client(const char *machine_filename, const char *client_name
 	}
 
 
-    // mehcached_free_network(port_mask);
+	// mehcached_free_network(port_mask);
 
-    printf("finished\n");
+	printf("finished\n");
 }
 
 int
 main(int argc, const char *argv[])
 {
-	if (argc < 5)
+	if (argc < 8)
 	{
-		printf("%s MACHINE-FILENAME CLIENT-NAME CPU-MODE PORT-MODE { WORKLOAD-FILENAME ... }\n", argv[0]);
+		printf("%s MACHINE-FILENAME CLIENT-NAME CPU-MODE PORT-MODE MAX-REQUEST-RATE NIC-RATIO NIC-NUM { WORKLOAD-FILENAME ... }\n", argv[0]);
 		return EXIT_FAILURE;
 	}
+	mehcached_max_request_rate = atoi(argv[5]);
 
-    mehcached_benchmark_client(argv[1], argv[2], atoi(argv[3]), atoi(argv[4]), argc - 5, argv + 5);
+	if (argc >= 7) { // includes nicmem
+		nic_ratio = atoi(argv[6]) / 100.0;
+		printf("using nicmem ratio %.2f\n", nic_ratio);
+	}
 
-    return EXIT_SUCCESS;
+	if (argc >= 8) { // includes nicmem
+		nic_num = atoi(argv[7]);
+		if (nic_num % 2 != 0)
+			return EXIT_FAILURE;
+		printf("using nic_num %d\n", nic_num);
+	} else {
+		nic_num = 256;
+	}
+
+	if (argc >= 9) {
+		force_nic_set = atoi(argv[8]);
+		printf("force nic set is %d\n", force_nic_set);
+	}
+
+	mehcached_benchmark_client(argv[1], argv[2], atoi(argv[3]), atoi(argv[4]), argc - 9, argv + 9);
+
+	return EXIT_SUCCESS;
 }
 

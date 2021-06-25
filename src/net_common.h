@@ -24,8 +24,14 @@
 #define MEHCACHED_MAX_PORTS (8)
 #define MEHCACHED_MAX_QUEUES (16)
 
+#define RTE_TEST_RX_DESC_DEFAULT (1024)
+#define RTE_TEST_TX_DESC_DEFAULT (1024)
+
 struct rte_mbuf *
 mehcached_packet_alloc();
+
+struct rte_mbuf *
+mehcached_packet_alloc_nicmem(int port_id);
 
 void
 mehcached_packet_free(struct rte_mbuf *mbuf);

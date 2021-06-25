@@ -29,7 +29,8 @@ add_definitions(-pthread)
 add_definitions(-g -Wall -Wextra -Wsign-conversion -Winline -Wno-unused-function)
 add_definitions(-Wconversion)
 add_definitions(-O9)
-add_definitions(-msse4.2 -march=corei7)
+# add_definitions(-msse4.2 -march=corei7)
+add_definitions(-mavx -march=native)
 
 # preprocessor
 SET(NDEBUG "$ENV{NDEBUG}" CACHE STRING "define NDEBUG macro")
@@ -61,19 +62,23 @@ set(LIBRARIES ${LIBRARIES} rt crypto perf_count m pthread)
 #set(LIBRARIES ${LIBRARIES} tcmalloc_minimal)
 
 # DPDK
-set(RTE_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../DPDK)
+set(RTE_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../dpdk)
 set(RTE_TARGET x86_64-default-linuxapp-gcc)
 add_definitions(-DUSE_DPDK)
+add_definitions(-DHOT_ITEMS)
+add_definitions(-DMEHCACHED_NO_EVICTION)
+add_definitions(-DMEHCACHED_USE_SOFT_FDIR)
+add_definitions(-DMEHCACHED_ENABLE_THROTTLING)
 add_definitions(-isystem ${RTE_SDK}/${RTE_TARGET}/include -include rte_config.h)
 link_directories(${LINK_DIRECTORIES} ${RTE_SDK}/${RTE_TARGET}/lib)
-set(LIBRARIES ${LIBRARIES} rte_eal rte_malloc rte_mempool rte_ring)	# for basic features
-set(LIBRARIES ${LIBRARIES} ethdev rte_mbuf rte_pmd_ixgbe librte_pmd_ring.a)	# for network features
+set(LIBRARIES ${LIBRARIES} rte_eal rte_mempool rte_ring)	# for basic features
+set(LIBRARIES ${LIBRARIES} rte_ethdev rte_mbuf rte_pmd_mlx5 librte_pmd_ring.a)	# for network features
 set(LIBRARIES ${LIBRARIES} pthread rt)	# to make sure symbols in pthread and rt are resolved
 
 if(NOT "${NLOCAL}" STREQUAL "yes")
 	# test
-	add_executable(test test.c ${SOURCES})
-	target_link_libraries(test ${LIBRARIES})
+	add_executable(test1 test.c ${SOURCES})
+	target_link_libraries(test1 ${LIBRARIES})
 
 	# load
 	add_executable(load load.c ${SOURCES})
@@ -111,7 +116,7 @@ endif()
 
 if(NOT "${NSERVER}" STREQUAL "yes")
 	# netbench_server
-	add_executable(netbench_server net_common.c netbench_config.c netbench_server.c ${SOURCES})
+	add_executable(netbench_server alloc_dynamic.c alloc_pool.c table.c net_common.c netbench_config.c netbench_server.c ${SOURCES})
 	target_link_libraries(netbench_server ${LIBRARIES})
 
 	# netbench_server_latency

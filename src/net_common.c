@@ -26,9 +26,11 @@
 #include <rte_ethdev.h>
 #include <rte_log.h>
 #include <rte_debug.h>
+#include <rte_flow.h>
 
 #define MEHCACHED_MBUF_ENTRY_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
-#define MEHCACHED_MBUF_SIZE (MEHCACHED_MAX_PORTS * MEHCACHED_MAX_QUEUES * 4096)     // TODO: need to divide by numa node count
+// #define MEHCACHED_MBUF_SIZE (MEHCACHED_MAX_PORTS * MEHCACHED_MAX_QUEUES * 2048)     // TODO: need to divide by numa node count
+#define MEHCACHED_MBUF_SIZE (32768)     // TODO: need to divide by numa node count
 
 #define MEHCACHED_MAX_PKT_BURST (32)
 
@@ -40,8 +42,6 @@
 #define MEHCACHED_TX_HTHRESH (0)
 #define MEHCACHED_TX_WTHRESH (0)
 
-#define RTE_TEST_RX_DESC_DEFAULT (128)
-#define RTE_TEST_TX_DESC_DEFAULT (512)
 static uint16_t mehcached_num_rx_desc = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t mehcached_num_tx_desc = RTE_TEST_TX_DESC_DEFAULT;
 
@@ -50,58 +50,23 @@ static uint16_t mehcached_num_tx_desc = RTE_TEST_TX_DESC_DEFAULT;
 
 static const struct rte_eth_conf mehcached_port_conf = {
 	.rxmode = {
-        .max_rx_pkt_len = ETHER_MAX_LEN,
+        .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
+		.mq_mode = ETH_MQ_RX_RSS,
+		.max_rx_pkt_len = RTE_ETHER_MAX_LEN,
 		.split_hdr_size = 0,
-		.header_split   = 0, /**< Header Split disabled */
-		.hw_ip_checksum = 0, /**< IP checksum offload disabled */
-		.hw_vlan_filter = 0, /**< VLAN filtering disabled */
-		.jumbo_frame    = 0, /**< Jumbo Frame Support disabled */
-		.hw_strip_crc   = 0, /**< CRC stripped by hardware */
-		.mq_mode = ETH_MQ_RX_NONE,
+		.offloads = DEV_RX_OFFLOAD_CHECKSUM | DEV_RX_OFFLOAD_SCATTER,
+	},
+	.rx_adv_conf = {
+		.rss_conf = {
+			.rss_key = NULL,
+			.rss_hf = ETH_RSS_IP,
+		},
 	},
 	.txmode = {
 		.mq_mode = ETH_MQ_TX_NONE,
-	},
-	.fdir_conf = {
-		//.mode =             RTE_FDIR_MODE_NONE,
-		.mode =             RTE_FDIR_MODE_PERFECT,
-		.pballoc =          RTE_FDIR_PBALLOC_64K,
-		//.pballoc =          RTE_FDIR_PBALLOC_256K,
-#ifndef NDEBUG
-		.status =           RTE_FDIR_NO_REPORT_STATUS,
-#else
-		.status =           RTE_FDIR_REPORT_STATUS_ALWAYS,
-#endif
-		.flexbytes_offset = 0,
-		.drop_queue =       0,
+		.offloads = DEV_TX_OFFLOAD_MULTI_SEGS,
 	},
 };
-
-static const struct rte_eth_rxconf mehcached_rx_conf = {
-	.rx_thresh = {
-		.pthresh = MEHCACHED_RX_PTHRESH,
-		.hthresh = MEHCACHED_RX_HTHRESH,
-		.wthresh = MEHCACHED_RX_WTHRESH,
-	},
-	.rx_free_thresh = 32,	// for DPDK >= 1.3
-	.rx_drop_en = 0,		// (does not seem to be used)
-};
-
-static const struct rte_eth_txconf mehcached_tx_conf = {
-	.tx_thresh = {
-		.pthresh = MEHCACHED_TX_PTHRESH,
-		.hthresh = MEHCACHED_TX_HTHRESH,
-		.wthresh = MEHCACHED_TX_WTHRESH,
-	},
-	.tx_free_thresh = 0, /* Use PMD default values */
-	.tx_rs_thresh = 0, /* Use PMD default values */
-#ifndef MEHCACHED_USE_SOFT_FDIR
-    .txq_flags = (ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOREFCOUNT | ETH_TXQ_FLAGS_NOMULTMEMP | ETH_TXQ_FLAGS_NOOFFLOADS),
-#else
-    .txq_flags = (ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOREFCOUNT | ETH_TXQ_FLAGS_NOOFFLOADS),
-#endif
-};
-
 
 struct mehcached_queue_state {
 	struct rte_mbuf *rx_mbufs[MEHCACHED_MAX_PKT_BURST];
@@ -131,7 +96,7 @@ struct mehcached_queue_state {
 
 static struct rte_mempool *mehcached_pktmbuf_pool[MEHCACHED_MAX_NUMA_NODES];
 
-//static uint16_t mehcached_lcore_to_queue[MEHCACHED_MAX_LCORES];
+static uint16_t mehcached_lcore_to_queue[MEHCACHED_MAX_LCORES];
 //static struct ether_addr mehcached_eth_addr[MEHCACHED_MAX_PORTS];
 
 static struct mehcached_queue_state *mehcached_queue_states[MEHCACHED_MAX_QUEUES * MEHCACHED_MAX_PORTS];
@@ -152,9 +117,9 @@ struct rte_mbuf *
 mehcached_receive_packet(uint8_t port_id)
 {
 	uint32_t lcore = rte_lcore_id();
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
-	// assert(queue != (uint16_t)-1);
-	uint16_t queue = (uint16_t)lcore;
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
+	assert(queue != (uint16_t)-1);
+	// uint16_t queue = (uint16_t)lcore;
 	struct mehcached_queue_state *state = mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id];
 
 	if (state->rx_next_to_use == state->rx_length)
@@ -250,12 +215,15 @@ void
 mehcached_receive_packets(uint8_t port_id, struct rte_mbuf **mbufs, size_t *in_out_num_mbufs)
 {
 	uint32_t lcore = rte_lcore_id();
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
 	// assert(queue != (uint16_t)-1);
-	uint16_t queue = (uint16_t)lcore;
+	//uint16_t queue = (uint16_t)lcore;
 	struct mehcached_queue_state *state = mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id];
 
+	// printf("reading %d pkts\n", (uint16_t)*in_out_num_mbufs);
 	*in_out_num_mbufs = (size_t)rte_eth_rx_burst(port_id, queue, mbufs, (uint16_t)*in_out_num_mbufs);
+	// if (*in_out_num_mbufs)
+	// 	printf("received %d pkts\n", (uint16_t)*in_out_num_mbufs);
 	state->num_rx_received += *in_out_num_mbufs;
 	state->num_rx_burst++;
 }
@@ -264,9 +232,9 @@ void
 mehcached_send_packet(uint8_t port_id, struct rte_mbuf *mbuf)
 {
 	uint32_t lcore = rte_lcore_id();
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
 	// assert(queue != (uint16_t)-1);
-	uint16_t queue = (uint16_t)lcore;
+	// uint16_t queue = (uint16_t)lcore;
 	struct mehcached_queue_state *state = mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id];
 
 #ifndef NDEBUG
@@ -276,6 +244,7 @@ mehcached_send_packet(uint8_t port_id, struct rte_mbuf *mbuf)
 	state->tx_mbufs[state->tx_length++] = mbuf;
 	if (state->tx_length == MEHCACHED_MAX_PKT_BURST)
 	{
+		// printf("sending port %d lcore %d queue %d\n", port_id, lcore, queue);
 		uint16_t count = rte_eth_tx_burst(port_id, queue, state->tx_mbufs, MEHCACHED_MAX_PKT_BURST);
 		state->num_tx_sent += count;
 		state->num_tx_dropped += (uint64_t)(MEHCACHED_MAX_PKT_BURST - count);
@@ -290,9 +259,9 @@ void
 mehcached_send_packet_flush(uint8_t port_id)
 {
 	uint32_t lcore = rte_lcore_id();
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
 	// assert(queue != (uint16_t)-1);
-	uint16_t queue = (uint16_t)lcore;
+	// uint16_t queue = (uint16_t)lcore;
 	struct mehcached_queue_state *state = mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id];
 
 	if (state->tx_length > 0)
@@ -316,9 +285,9 @@ mehcached_get_stats(uint8_t port_id, uint64_t *out_num_rx_burst, uint64_t *out_n
 void
 mehcached_get_stats_lcore(uint8_t port_id, uint32_t lcore, uint64_t *out_num_rx_burst, uint64_t *out_num_rx_received, uint64_t *out_num_tx_burst, uint64_t *out_num_tx_sent, uint64_t *out_num_tx_dropped)
 {
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
 	// assert(queue != (uint16_t)-1);
-	uint16_t queue = (uint16_t)lcore;
+	// uint16_t queue = (uint16_t)lcore;
 	struct mehcached_queue_state *state = mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id];
 
 	if (out_num_rx_burst)
@@ -354,21 +323,28 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 
 	assert(rte_lcore_count() <= MEHCACHED_MAX_LCORES);
 
-	// count required queues
-	for (i = 0; i < rte_lcore_count(); i++)
-	{
-		if ((cpu_mask & ((uint64_t)1 << i)) != 0)
-			num_queues++;
+	RTE_LCORE_FOREACH(i){
+		printf("active core %d\n", i);
+		num_queues++;
 	}
+
+	// count required queues
+	// for (i = 0; i < rte_lcore_count(); i++)
+	// {
+	// 	if ((cpu_mask & ((uint64_t)1 << i)) != 0)
+	// 		num_queues++;
+	// }
 	assert(num_numa_nodes <= MEHCACHED_MAX_QUEUES);
 
 	// count numa nodes
-	for (i = 0; i < rte_lcore_count(); i++)
+	// for (i = 0; i < rte_lcore_count(); i++)
+	RTE_LCORE_FOREACH(i)
 	{
 		uint32_t socket_id = (uint32_t)rte_lcore_to_socket_id((unsigned int)i);
 		if (num_numa_nodes <= socket_id)
 			num_numa_nodes = socket_id + 1;
 	}
+	printf("num numa nodes %d\n", num_numa_nodes);
 	assert(num_numa_nodes <= MEHCACHED_MAX_NUMA_NODES);
 
 	// initialize pktmbuf
@@ -379,7 +355,7 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		snprintf(pool_name, sizeof(pool_name), "pktmbuf_pool%zu", i);
 		// if this is not big enough, RX/TX performance may not be consistent, e.g., between CREW and CRCW experiments
 		// the maximum cache size can be adjusted in DPDK's .config file: CONFIG_RTE_MEMPOOL_CACHE_MAX_SIZE
-		const unsigned int cache_size = MEHCACHED_MAX_PORTS * 1024;
+		const unsigned int cache_size = 512;
 		mehcached_pktmbuf_pool[i] = rte_mempool_create(pool_name, MEHCACHED_MBUF_SIZE, MEHCACHED_MBUF_ENTRY_SIZE, cache_size, sizeof(struct rte_pktmbuf_pool_private), rte_pktmbuf_pool_init, NULL, rte_pktmbuf_init, NULL, (int)i, 0);
 		if (mehcached_pktmbuf_pool[i] == NULL)
 		{
@@ -388,33 +364,34 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		}
 	}
 
+	uint8_t port_id;
+
 	// initialize driver
 #ifdef RTE_LIBRTE_IXGBE_PMD
 	printf("initializing PMD\n");
-	if (rte_ixgbe_pmd_init() < 0)
-	{
-		fprintf(stderr, "failed to initialize ixgbe pmd\n");
-		return false;
-	}
+	// if (rte_ixgbe_pmd_init() < 0)
+	// if (rte{
+	// if (rte	fprintf(stderr, "failed to initialize ixgbe pmd\n");
+	// if (rte	return false;
+	// if (rte}
 #endif
 
 	printf("probing PCI\n");
-	if (rte_eal_pci_probe() < 0)
-	{
-		fprintf(stderr, "failed to probe PCI\n");
-		return false;
-	}
+	// if (rte_eal_pci_probe() < 0)
+	// {
+	// 	fprintf(stderr, "failed to probe PCI\n");
+	// 	return false;
+	// }
 
 	// TODO: initialize and set up timer for forced TX
 
 	// check port and queue limits
-	uint8_t num_ports = rte_eth_dev_count();
-	assert(num_ports <= MEHCACHED_MAX_PORTS);
+	uint8_t num_ports = rte_eth_dev_count_avail();
+	// assert(num_ports <= MEHCACHED_MAX_PORTS);
 	*out_num_ports = num_ports;
 
 	printf("checking queue limits\n");
-	uint8_t port_id;
-	for (port_id = 0; port_id < num_ports; port_id++)
+	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
@@ -431,24 +408,24 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 
 	// map queues to lcores
 	uint32_t lcore = 0;
-	// uint16_t queue = 0;
-// 	for (lcore = 0; lcore < rte_lcore_count(); lcore++)
-// 	{
-// 		if ((cpu_mask & ((uint64_t)1 << i)) == 0)
-// 		{
-// 			mehcached_lcore_to_queue[lcore] = (uint16_t)-1;
-// 			continue;
-// 		}
+	uint16_t queue = 0;
+	memset(mehcached_lcore_to_queue, -1, MEHCACHED_MAX_LCORES * sizeof(mehcached_lcore_to_queue[0]));
+	// for (lcore = 0; lcore < MEHCACHED_MAX_LCORES; lcore++)
+	RTE_LCORE_FOREACH(lcore)
+	{
+		// if ((cpu_mask & ((uint64_t)1 << i)) == 0)
+		// {
+		// 	mehcached_lcore_to_queue[lcore] = (uint16_t)-1;
+		// 	continue;
+		// }
 
-// 		mehcached_lcore_to_queue[lcore] = queue;
-// #ifndef NDEBUG
-// 		printf("queue %hhu mapped to lcore %hu\n", queue, lcore);
-// #endif
-// 		queue++;
-// 	}
+		mehcached_lcore_to_queue[lcore] = queue;
+		printf("queue %hhu mapped to lcore %hu\n", queue, lcore);
+		queue++;
+	}
 
 	// initialize ports
-	for (port_id = 0; port_id < num_ports; port_id++)
+	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
@@ -466,23 +443,43 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 		}
 
 		uint32_t lcore;
-		for (lcore = 0; lcore < rte_lcore_count(); lcore++)
+		printf("initializing core queues....\n");
+		// for (lcore = 0; lcore < rte_lcore_count(); lcore++)
+		RTE_LCORE_FOREACH(lcore)
 		{
-			// uint16_t queue = mehcached_lcore_to_queue[lcore];
-			// if (queue == (uint16_t)-1)
-			// 	continue;
-			uint16_t queue = (uint16_t)lcore;
+			struct rte_eth_dev_info dev_info;
+			struct rte_eth_txconf *memcached_tx_conf;
+			struct rte_eth_txconf *memcached_rx_conf;
+			queue = mehcached_lcore_to_queue[lcore];
+			printf("lcore %d queue %d\n", lcore, queue);
+			if (queue == (uint16_t)-1)
+				continue;
+			// uint16_t queue = (uint16_t)lcore;
 
 			size_t numa_node = rte_lcore_to_socket_id((unsigned int)lcore);
+			printf("setting core %d queue %d\n", lcore, queue);
+			rte_eth_dev_info_get((uint8_t)port_id, &dev_info);
+			memcached_tx_conf = &dev_info.default_txconf;
+			memcached_tx_conf->offloads = mehcached_port_conf.txmode.offloads;
+			memcached_rx_conf = &dev_info.default_rxconf;
+			memcached_rx_conf->offloads = mehcached_port_conf.rxmode.offloads;
 
-			ret = rte_eth_rx_queue_setup(port_id, queue, (unsigned int)mehcached_num_rx_desc, (unsigned int)numa_node, &mehcached_rx_conf, mehcached_pktmbuf_pool[numa_node]);
+			// ret = rte_eth_rx_queue_setup(port_id, queue, (unsigned int)mehcached_num_rx_desc, (unsigned int)numa_node, &memcached_rx_conf, mehcached_pktmbuf_pool[numa_node]);
+			ret = rte_eth_rx_queue_setup(port_id, queue,
+						     (unsigned int)mehcached_num_rx_desc,
+						     (unsigned int)numa_node, memcached_rx_conf,
+						     mehcached_pktmbuf_pool[numa_node]);
 			if (ret < 0)
 			{
 				fprintf(stderr, "failed to configure port %hhu rx_queue %hu (err=%d)\n", port_id, queue, ret);
 				return false;
 			}
 
-			ret = rte_eth_tx_queue_setup(port_id, queue, (unsigned int)mehcached_num_tx_desc, (unsigned int)numa_node, &mehcached_tx_conf);
+			// ret = rte_eth_tx_queue_setup(port_id, queue, (unsigned int)mehcached_num_tx_desc, (unsigned int)numa_node, &memcached_tx_conf);
+			ret = rte_eth_tx_queue_setup(port_id, queue,
+						     (unsigned int)mehcached_num_tx_desc,
+						     (unsigned int)numa_node,
+						     memcached_tx_conf);
 			if (ret < 0)
 			{
 				fprintf(stderr, "failed to configure port %hhu tx_queue %hu (err=%d)\n", port_id, queue, ret);
@@ -507,7 +504,7 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 
 	// the following takes some time, but this ensures the device ready for full speed RX/TX when the initialization is done
 	// without this, the initial packet transmission may be blocked
-	for (port_id = 0; port_id < num_ports; port_id++)
+	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
@@ -527,13 +524,19 @@ mehcached_init_network(uint64_t cpu_mask, uint64_t port_mask, uint8_t *out_num_p
 	}
 
 	memset(mehcached_queue_states, 0, sizeof(mehcached_queue_states));
-	for (port_id = 0; port_id < num_ports; port_id++)
-		for (lcore = 0; lcore < rte_lcore_count(); lcore++)
+	RTE_ETH_FOREACH_DEV(port_id)
+	{
+		// for (lcore = 0; lcore < rte_lcore_count(); lcore++)
+		RTE_LCORE_FOREACH(lcore)
 		{
-			uint16_t queue = (uint16_t)lcore;
+			queue = mehcached_lcore_to_queue[lcore];
+			if (queue == (uint16_t)-1)
+				continue;
+			// uint16_t queue = (uint16_t)lcore;
 			mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id] = mehcached_eal_malloc_lcore(sizeof(struct mehcached_queue_state), lcore);
 			memset(mehcached_queue_states[queue * MEHCACHED_MAX_PORTS + port_id], 0, sizeof(struct mehcached_queue_state));
 		}
+	}
 
 	return true;
 }
@@ -542,9 +545,9 @@ void
 mehcached_free_network(uint64_t port_mask)
 {
 	uint8_t port_id;
-	uint8_t num_ports = rte_eth_dev_count();
+	uint8_t num_ports = rte_eth_dev_count_avail();
 	
-	for (port_id = 0; port_id < num_ports; port_id++)
+	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
@@ -553,7 +556,7 @@ mehcached_free_network(uint64_t port_mask)
 		rte_eth_dev_stop(port_id);
 	}
 
-	for (port_id = 0; port_id < num_ports; port_id++)
+	RTE_ETH_FOREACH_DEV(port_id)
 	{
 		if ((port_mask & ((uint64_t)1 << port_id)) == 0)
 			continue;
@@ -566,16 +569,16 @@ mehcached_free_network(uint64_t port_mask)
 bool
 mehcached_set_dst_port_mask(uint8_t port_id, uint16_t l4_dst_port_mask)
 {
-	struct rte_fdir_masks mask;
-	memset(&mask, 0, sizeof(mask));
-	mask.dst_port_mask = l4_dst_port_mask;	// this must be little-endian (host)
+	// struct rte_fdir_masks mask;
+	// memset(&mask, 0, sizeof(mask));
+	// mask.dst_port_mask = l4_dst_port_mask;	// this must be little-endian (host)
 
-	int ret = rte_eth_dev_fdir_set_masks(port_id, &mask);
-	if (ret < 0)
-	{
-		fprintf(stderr, "failed to set perfect filter mask on port %hhu (err=%d)\n", port_id, ret);
-		return false;
-	}
+	// int ret = rte_eth_dev_fdir_set_masks(port_id, &mask);
+	// if (ret < 0)
+	// {
+	// 	fprintf(stderr, "failed to set perfect filter mask on port %hhu (err=%d)\n", port_id, ret);
+	// 	return false;
+	// }
 
 	return true;
 }
@@ -583,27 +586,82 @@ mehcached_set_dst_port_mask(uint8_t port_id, uint16_t l4_dst_port_mask)
 bool
 mehcached_set_dst_port_mapping(uint8_t port_id, uint16_t l4_dst_port, uint32_t lcore)
 {
-	// uint16_t queue = mehcached_lcore_to_queue[lcore];
-	// if (queue == (uint16_t)-1)
-	// {
-	// 	fprintf(stderr, "no queue on port %hhu exists for lcore %u\n", port_id, lcore);
-	// 	return false;
-	// }
-	uint16_t queue = (uint16_t)lcore;
-
-	struct rte_fdir_filter filter;
-	memset(&filter, 0, sizeof(filter));
-	filter.iptype = RTE_FDIR_IPTYPE_IPV4;
-	filter.l4type = RTE_FDIR_L4TYPE_UDP;
-	filter.port_dst = rte_cpu_to_be_16((uint16_t)l4_dst_port);    // this must be big-endian
-    uint16_t soft_id = (uint16_t)l4_dst_port;	// will be unique on each port (with perfect filter)
-
-	int ret = rte_eth_dev_fdir_add_perfect_filter(port_id, &filter, soft_id, (uint8_t)queue, 0);
-	if (ret < 0)
+	uint16_t queue = mehcached_lcore_to_queue[lcore];
+	if (queue == (uint16_t)-1)
 	{
-		fprintf(stderr, "failed to add perfect filter entry on port %hhu (err=%d)\n", port_id, ret);
+		fprintf(stderr, "no queue on port %hhu exists for lcore %u\n", port_id, lcore);
 		return false;
 	}
+	// uint16_t queue = (uint16_t)lcore;
+	printf("Mapping port %d to queue %d\n", l4_dst_port, lcore);
 
-	return true;
+	struct rte_flow_attr attr;
+	struct rte_flow_item pattern[4];
+	struct rte_flow_action action[2];
+	struct rte_flow *flow = NULL;
+	struct rte_flow_action_queue act_queue = { .index = queue };
+	struct rte_flow_item_udp udp_spec;
+	struct rte_flow_item_udp udp_mask = {};
+	struct rte_flow_error error;
+	int res;
+
+	memset(pattern, 0, sizeof(pattern));
+	memset(action, 0, sizeof(action));
+	memset(&attr, 0, sizeof(struct rte_flow_attr));
+	attr.ingress = 1;
+
+	/*
+	 * create the action sequence.
+	 * one action only,  move packet to queue
+	 */
+	action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+	action[0].conf = &act_queue;
+	action[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+	/*
+	 * set the first level of the pattern (ETH).
+	 * since in this example we just want to get the
+	 * ipv4 we set this level to allow all.
+	 */
+	pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+	pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
+	pattern[2].type = RTE_FLOW_ITEM_TYPE_UDP;
+	pattern[2].spec = &udp_spec;
+	pattern[2].mask = &udp_mask;
+
+	memset(&udp_spec, 0, sizeof(struct rte_flow_item_udp));
+	memset(&udp_mask, 0, sizeof(struct rte_flow_item_udp));
+	udp_spec.hdr.dst_port = htons(l4_dst_port);
+	udp_mask.hdr.dst_port = 0xffff;
+	//udp_spec.hdr.src_port = 123123;
+	//udp_mask.hdr.src_port = 0;
+
+	pattern[3].type = RTE_FLOW_ITEM_TYPE_END;
+
+	res = rte_flow_validate(port_id, &attr, pattern, action, &error);
+	if (!res)
+		flow = rte_flow_create(port_id, &attr, pattern, action, &error);
+
+	if (!flow) {
+		printf("Flow can't be created %d message: %s\n",
+		       error.type,
+		       error.message ? error.message : "(no stated reason)");
+		return 0;
+	}
+////////////////////////////////////////////////////
+	// struct rte_fdir_filter filter;
+	// memset(&filter, 0, sizeof(filter));
+	// filter.iptype = RTE_FDIR_IPTYPE_IPV4;
+	// filter.l4type = RTE_FDIR_L4TYPE_UDP;
+	// filter.port_dst = rte_cpu_to_be_16((uint16_t)l4_dst_port);    // this must be big-endian
+	// 16_t soft_id = (uint16_t)l4_dst_port;	// will be unique on each port (with perfect filter)
+
+	// int ret = rte_eth_dev_fdir_add_perfect_filter(port_id, &filter, soft_id, (uint8_t)queue, 0);
+	// if (ret < 0)
+	// {
+	// 	fprintf(stderr, "failed to add perfect filter entry on port %hhu (err=%d)\n", port_id, ret);
+	// 	return false;
+	// }
+
+	return 1;
 }
